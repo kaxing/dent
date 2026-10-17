@@ -5,28 +5,37 @@ const manifest_mod = @import("manifest.zig");
 const Io = std.Io;
 const Dir = Io.Dir;
 
-const VERSION = "0.0.4";
+const VERSION = "0.0.5";
 
 const USAGE =
-    \\checkpoint — local file snapshot tool
+    \\dent — leave a dent. Find your way back.
     \\
-    \\  <id>    checkpoint number (shown as #1, #2, ... in list output)
-    \\  <path>  file path relative to repo root (e.g. src/main.zig)
+    \\A trail of local checkpoints for agents exploring a codebase.
     \\
-    \\check                       create checkpoint
-    \\check "text"                create checkpoint with a note
-    \\check rollback              rollback to latest checkpoint
-    \\check rollback <id>         rollback to a specific checkpoint
-    \\check rollback <id> <path>  rollback a single file
-    \\check diff <id>             show added/removed/modified files
-    \\check diff <id> <path>      show content diff for one file
-    \\check list                  show all checkpoints
-    \\check list <N>              show last N checkpoints
-    \\check edit <id> "text"      update note
-    \\check remove <id>           remove a checkpoint
-    \\check remove --keep <N>     delete all but last N
-    \\check remove all            remove all checkpoints
-    \\check version               show version
+    \\LEAVE A DENT
+    \\  dent                      save where you are
+    \\  dent "before the refactor" save with a note
+    \\
+    \\READ THE TRAIL
+    \\  dent list [N]             show all dents, or the last N
+    \\  dent diff [id] [path]     compare working files with a dent
+    \\  dent edit <id> "note"     update a dent's note
+    \\
+    \\FIND YOUR WAY BACK
+    \\  dent rollback [id]        restore a dent (default: latest)
+    \\  dent rollback <id> <path> restore one file, without auto-save
+    \\
+    \\TRIM THE TRAIL
+    \\  dent remove <id>          remove one dent
+    \\  dent remove --keep <N>    keep only the last N
+    \\  dent remove all           remove all dents (asks first)
+    \\
+    \\  dent version              show version
+    \\  dent --help               show this guide
+    \\
+    \\Use numeric IDs from `dent list`. Paths are relative to this directory.
+    \\Full rollback saves changed working files as <auto> before restoring.
+    \\Dents are local recovery points, not a backup. Keep your Git history.
     \\
 ;
 
@@ -39,6 +48,7 @@ fn out(comptime fmt: []const u8, args: anytype) void {
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     var buf: [4096]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch &buf;
+    _ = std.c.write(2, "dent: ", 6);
     _ = std.c.write(2, msg.ptr, msg.len);
     _ = std.c.write(2, "\n", 1);
     std.process.exit(1);
@@ -65,22 +75,22 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "rollback")) {
         const id = parseOptionalId(args.next());
         const path = args.next();
-        if (path != null and id == null) fatal("usage: check rollback <id> <path>", .{});
+        if (path != null and id == null) fatal("usage: dent rollback <id> <path>", .{});
         return doRollback(allocator, id, path);
     }
 
     if (std.mem.eql(u8, command, "edit")) {
-        const id_str = args.next() orelse fatal("usage: check edit <id> \"text\"", .{});
-        const id = std.fmt.parseInt(u32, id_str, 10) catch fatal("usage: check edit <id> \"text\"", .{});
-        const note = args.next() orelse fatal("usage: check edit <id> \"text\"", .{});
+        const id_str = args.next() orelse fatal("usage: dent edit <id> \"text\"", .{});
+        const id = std.fmt.parseInt(u32, id_str, 10) catch fatal("usage: dent edit <id> \"text\"", .{});
+        const note = args.next() orelse fatal("usage: dent edit <id> \"text\"", .{});
         return doNote(allocator, id, note);
     }
 
     if (std.mem.eql(u8, command, "remove")) {
         const next = args.next() orelse {
-            out("check remove <id>         remove a checkpoint\n", .{});
-            out("check remove --keep N     delete all but last N\n", .{});
-            out("check remove all          remove all checkpoints\n", .{});
+            out("dent remove <id>         remove a checkpoint\n", .{});
+            out("dent remove --keep N     delete all but last N\n", .{});
+            out("dent remove all          remove all checkpoints\n", .{});
             return;
         };
         if (std.mem.eql(u8, next, "all")) {
@@ -92,7 +102,7 @@ pub fn main(init: std.process.Init) !void {
             if (keep == 0) fatal("--keep must be at least 1", .{});
             return doCleanup(allocator, keep);
         }
-        const id = std.fmt.parseInt(u32, next, 10) catch fatal("check remove <id> — id must be a number", .{});
+        const id = std.fmt.parseInt(u32, next, 10) catch fatal("dent remove <id> — id must be a number", .{});
         return doRemove(allocator, id);
     }
 
@@ -107,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
         const next = args.next();
         var recent: ?u32 = null;
         if (next) |n| {
-            recent = std.fmt.parseInt(u32, n, 10) catch fatal("usage: check list <N>", .{});
+            recent = std.fmt.parseInt(u32, n, 10) catch fatal("usage: dent list <N>", .{});
         }
         return doList(allocator, recent);
     }
@@ -192,13 +202,13 @@ fn doSave(allocator: std.mem.Allocator, name: ?[]const u8) void {
     const id = r.save(name) catch |e| fatal("save failed: {} (errno={})", .{ e, std.c._errno().* });
     if (isDuplicateCheckpoint(allocator, &r, id)) {
         removeDuplicateCheckpoint(&r, id);
-        out("checkpoint already existed\n", .{});
+        out("unchanged · already on your trail\n", .{});
         return;
     }
     if (name) |n| {
-        out("checkpoint #{d} \"{s}\"\n", .{ id, n });
+        out("dent #{d} · {s}\n", .{ id, n });
     } else {
-        out("checkpoint #{d}\n", .{id});
+        out("dent #{d} · saved\n", .{id});
     }
 }
 
@@ -223,7 +233,7 @@ fn doRollback(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
             if (e == error.FileNotFound) fatal("file not in checkpoint #{d}: {s}", .{ target_id, file_path });
             fatal("rollback failed: {}", .{e});
         };
-        out("rolled back {s} from #{d}\n", .{ file_path, target_id });
+        out("back to #{d} · {s}\n", .{ target_id, file_path });
         return;
     }
 
@@ -236,15 +246,11 @@ fn doRollback(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
     if (isDuplicateCheckpoint(allocator, &r, auto_id)) {
         removeDuplicateCheckpoint(&r, auto_id);
     } else {
-        out("checkpoint #{d} \"<auto>\"\n", .{auto_id});
+        out("dent #{d} · <auto> · saved before rollback\n", .{auto_id});
     }
 
     r.restore(target_id) catch |e| fatal("rollback failed: {}", .{e});
-    if (id) |_| {
-        out("rolled back to #{d}\n", .{target_id});
-    } else {
-        out("rolled back to latest\n", .{});
-    }
+    out("back to #{d} · restored\n", .{target_id});
 }
 
 fn removeAutoCheckpoint(allocator: std.mem.Allocator, r: *repo_mod.Repo, skip_id: u32) void {
@@ -293,7 +299,7 @@ fn doNote(allocator: std.mem.Allocator, id: u32, note: []const u8) void {
         .tree_hash = m.tree_hash,
     }) catch |e| fatal("failed to update note: {}", .{e});
 
-    out("#{d} \"{s}\"\n", .{ id, note });
+    out("noted #{d} · {s}\n", .{ id, note });
 }
 
 fn doRemove(allocator: std.mem.Allocator, id: u32) void {
@@ -333,7 +339,7 @@ fn doRemove(allocator: std.mem.Allocator, id: u32) void {
         }
     }
 
-    out("removed #{d}\n", .{id});
+    out("removed #{d} · working files unchanged\n", .{id});
 }
 
 fn doDiff(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
@@ -385,7 +391,7 @@ fn doDiff(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
     }
 
     // Header: which snapshot
-    out("diff current vs #{d}\n", .{resolved_id});
+    out("since #{d} · working changes\n", .{resolved_id});
 
     if (result.added.len == 0 and result.removed.len == 0 and result.modified.len == 0) {
         out("no changes\n", .{});
@@ -415,7 +421,7 @@ fn doList(allocator: std.mem.Allocator, recent: ?u32) void {
     }
 
     if (manifests.len == 0) {
-        out("no checkpoints\n", .{});
+        out("no dents yet · leave one with `dent`\n", .{});
         return;
     }
 
@@ -424,26 +430,26 @@ fn doList(allocator: std.mem.Allocator, recent: ?u32) void {
     const cwd_ptr = std.c.getcwd(&path_buf, path_buf.len);
     if (cwd_ptr) |p| {
         const cwd_path = std.mem.sliceTo(p, 0);
-        out("{s}/.checkpoint-files/\n", .{cwd_path});
+        out("trail · {s}/.checkpoint-files/\n", .{cwd_path});
     }
 
     // Print newest first, limited by recent
     const show_count = if (recent) |n| @min(n, manifests.len) else manifests.len;
+    out("{d} of {d} dents · newest first\n\n", .{ show_count, manifests.len });
     var i = manifests.len;
     var shown: usize = 0;
     while (i > 0 and shown < show_count) {
         i -= 1;
         shown += 1;
         const m = manifests[i];
-        const name_display: []const u8 = if (m.name.len > 0) m.name else "-";
+        const name_display: []const u8 = if (m.name.len > 0) m.name else "(no note)";
         const ts = formatTimestamp(m.timestamp);
         const size = formatSize(m.total_size);
-        out("#{d:<4} {s:<20} {d:>4} files  {s}  {s} UTC\n", .{
-            m.id,
-            name_display,
-            m.file_count,
-            @as([]const u8, &size),
+        out("#{d} · {s}\n", .{ m.id, name_display });
+        out("  {s} UTC · {d} files · {s}\n", .{
             @as([]const u8, &ts),
+            m.file_count,
+            std.mem.trim(u8, &size, " "),
         });
     }
 }
@@ -458,9 +464,9 @@ fn doCleanup(allocator: std.mem.Allocator, keep: u32) void {
     defer r.deinit();
     const deleted = r.pruneKeepLast(keep) catch |e| fatal("cleanup failed: {}", .{e});
     if (deleted == 0) {
-        out("nothing to clean up\n", .{});
+        out("trail unchanged · nothing to remove\n", .{});
     } else {
-        out("removed {d} checkpoints, kept last {d}\n", .{ deleted, keep });
+        out("trimmed {d} dents · kept last {d}\n", .{ deleted, keep });
     }
 }
 
@@ -480,18 +486,18 @@ fn doRemoveAll(allocator: std.mem.Allocator) void {
     }
 
     if (manifests.len == 0) {
-        out("no checkpoints to remove\n", .{});
+        out("trail empty · nothing to remove\n", .{});
         return;
     }
 
-    out("remove all {d} checkpoints? [y/N] ", .{manifests.len});
+    out("remove all {d} dents? This erases your recovery trail, not working files. [y/N] ", .{manifests.len});
 
     var buf: [16]u8 = undefined;
     const n = std.c.read(0, &buf, buf.len);
     if (n <= 0) fatal("aborted", .{});
     const answer = std.mem.trimEnd(u8, buf[0..@intCast(n)], "\n\r \t");
     if (!std.mem.eql(u8, answer, "y") and !std.mem.eql(u8, answer, "Y")) {
-        out("aborted\n", .{});
+        out("cancelled · trail unchanged\n", .{});
         return;
     }
 
@@ -506,7 +512,7 @@ fn doRemoveAll(allocator: std.mem.Allocator) void {
     r.cp_dir.deleteFile(io(), "pack.dat") catch {};
     r.cp_dir.deleteFile(io(), "pack.idx") catch {};
 
-    out("removed all {d} checkpoints\n", .{manifests.len});
+    out("removed all {d} dents · working files unchanged\n", .{manifests.len});
 }
 
 fn formatSize(bytes: u64) [8]u8 {

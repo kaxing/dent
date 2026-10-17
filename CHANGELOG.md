@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.0.5
+
+- Renamed the project to `dent` and the CLI from `check` to `dent`.
+- Leave a dent before an agent changes course, so it can find its way back.
+- Redesigned help into leave/read/return/trim sections and the trail into compact two-line entries.
+- Consistent `dent #id`, `since #id`, and `back to #id` output; errors use a `dent:` prefix.
+- Rollback reports its resolved ID; removal prompts explain what will be deleted.
+- Updated documentation, release archives, and Homebrew packaging.
+- Existing `.checkpoint-files/` storage remains compatible; no data migration.
+- Updated integration tests and benchmarks to the current positional-note, `edit`, and `list <N>` syntax.
+
 ## v0.0.3
 
 Breaking changes:

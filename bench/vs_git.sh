@@ -1,15 +1,15 @@
 #!/bin/bash
-# Benchmark: check vs git stash
+# Benchmark: dent vs git stash
 # Tests save/restore latency on realistic source trees
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CHECK="${1:-$SCRIPT_DIR/../zig-out/bin/check}"
+CHECK="${1:-$SCRIPT_DIR/../zig-out/bin/dent}"
 CHECK="$(cd "$(dirname "$CHECK")" && pwd)/$(basename "$CHECK")"
 
 if [ ! -x "$CHECK" ]; then
-    echo "error: check binary not found at $CHECK"
+    echo "error: dent binary not found at $CHECK"
     echo "run: make build"
     exit 1
 fi
@@ -77,22 +77,22 @@ bench_scenario() {
     echo "=== $name ($file_count files) ==="
     echo ""
 
-    # --- check ---
+    # --- dent ---
     local check_dir="$TMPDIR/check_$name"
     cp -r "$dir" "$check_dir"
     cd "$check_dir"
 
     # First save (cold)
-    local check_save1=$(time_ms "$CHECK --name 'initial' >/dev/null")
+    local check_save1=$(time_ms "$CHECK 'initial' >/dev/null")
 
     # Apply edits
     apply_edits "$check_dir"
 
     # Second save (warm, with dedup)
-    local check_save2=$(time_ms "$CHECK --name 'after-edit' >/dev/null")
+    local check_save2=$(time_ms "$CHECK 'after-edit' >/dev/null")
 
     # Restore
-    local check_restore=$(time_ms "$CHECK restore 1 >/dev/null")
+    local check_restore=$(time_ms "$CHECK rollback 1 >/dev/null")
 
     # --- git stash ---
     local git_dir="$TMPDIR/git_$name"
@@ -116,7 +116,7 @@ bench_scenario() {
     local git_save2=$(time_ms "git stash -q")
 
     # Print results
-    printf "%-20s %8s %8s\n"    ""           "check"   "git"
+    printf "%-20s %8s %8s\n"    ""           "dent"    "git"
     printf "%-20s %7dms %8s\n"  "save (cold)"    "$check_save1" "-"
     printf "%-20s %7dms %7dms\n" "save (warm)"    "$check_save2" "$git_save"
     printf "%-20s %7dms %7dms\n" "restore"         "$check_restore" "$git_restore"
@@ -136,7 +136,7 @@ bench_scenario "large"  "$LARGE"  2000
 
 echo ""
 echo "Notes:"
-echo "  - check save (cold): first snapshot, no dedup possible"
-echo "  - check save (warm): second snapshot, ~95% chunks deduped"
+echo "  - dent save (cold): first snapshot, no dedup possible"
+echo "  - dent save (warm): second snapshot, ~95% chunks deduped"
 echo "  - git stash: requires existing repo with initial commit"
 echo "  - times in milliseconds, lower is better"

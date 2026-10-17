@@ -1,492 +1,156 @@
 #!/usr/bin/env bash
-#
-# Integration tests for check CLI
-# Usage: bash test-coverage/integration.sh [path-to-check-binary]
-#
-
+# Integration tests for dent's command and output contract.
+# Usage: bash test-coverage/integration.sh [path-to-dent-binary]
 set -euo pipefail
-
-CHECK="$(cd "$(dirname "${1:-./zig-out/bin/check}")" && pwd)/$(basename "${1:-./zig-out/bin/check}")"
-TMPDIR_BASE=$(mktemp -d)
+DENT="$(cd "$(dirname "${1:-./zig-out/bin/dent}")" && pwd)/$(basename "${1:-./zig-out/bin/dent}")"
+ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dent.XXXXXX")
+trap 'rm -rf "$ROOT"' EXIT
 PASS=0
-FAIL=0
-
-cleanup() { rm -rf "$TMPDIR_BASE"; }
-trap cleanup EXIT
-
-# --- helpers ---
-
-new_test_dir() {
-    local d="$TMPDIR_BASE/test_$$_$RANDOM"
-    mkdir -p "$d"
-    echo "$d"
+new_dir() { cd "$(mktemp -d "$ROOT/case.XXXXXX")"; }
+contains() {
+    if ! grep -qF -- "$2" <<< "$1"; then
+        printf 'FAIL: expected %s in:\n%s\n' "$2" "$1" >&2
+        exit 1
+    fi
+    PASS=$((PASS + 1))
+}
+equals() {
+    if [ "$1" != "$2" ]; then
+        printf 'FAIL: expected <%s>, got <%s>\n' "$2" "$1" >&2
+        exit 1
+    fi
+    PASS=$((PASS + 1))
+}
+fails() {
+    if "$@" >"$ROOT/error" 2>&1; then
+        echo "FAIL: expected failure: $*" >&2
+        exit 1
+    fi
+    contains "$(<"$ROOT/error")" 'dent: '
 }
 
-pass() { PASS=$((PASS + 1)); printf "  \033[32mPASS\033[0m %s\n" "$1"; }
-fail() { FAIL=$((FAIL + 1)); printf "  \033[31mFAIL\033[0m %s: %s\n" "$1" "$2"; }
+new_dir
+contains "$("$DENT" --help)" 'leave a dent. Find your way back.'
+contains "$("$DENT" --help)" 'READ THE TRAIL'
+contains "$("$DENT" --help)" 'without auto-save'
+equals "$("$DENT" version)" 'v0.0.5'
+equals "$("$DENT" --version)" 'v0.0.5'
+# Informational commands must not create storage.
+[ ! -d .checkpoint-files ]
+for command in rollback diff list; do fails "$DENT" "$command"; done
+fails "$DENT" remove 1
 
-assert_eq() {
-    if [ "$1" = "$2" ]; then pass "$3"; else fail "$3" "expected '$2', got '$1'"; fi
-}
+# Save, notes, duplicate detection and the legacy storage location.
+echo one > file.txt
+contains "$("$DENT" 'before the refactor')" 'dent #1 · before the refactor'
+[ -d .checkpoint-files ]
+contains "$("$DENT")" 'unchanged · already on your trail'
+contains "$("$DENT" list)" '1 of 1 dents'
+contains "$("$DENT" list)" '.checkpoint-files/'
+contains "$("$DENT" edit 1 'known good')" 'noted #1 · known good'
+contains "$("$DENT" list)" '#1 · known good'
+fails "$DENT" edit 99 nope
+fails "$DENT" remove 99
+contains "$("$DENT" remove)" 'dent remove'
 
-assert_contains() {
-    if echo "$1" | grep -qF -- "$2"; then pass "$3"; else fail "$3" "output missing '$2'"; fi
-}
+# Diff and rollback, including recovery of unsaved work.
+echo two > file.txt
+echo added > added.txt
+OUT=$("$DENT" diff)
+contains "$OUT" 'since #1 · working changes'
+contains "$OUT" '~ file.txt'
+contains "$OUT" '+ added.txt'
+OUT=$("$DENT" diff 1 file.txt)
+contains "$OUT" '--- #1 file.txt'
+contains "$OUT" '+++ current file.txt'
+contains "$OUT" '-one'
+contains "$OUT" '+two'
+contains "$("$DENT" diff 1 added.txt)" '+added'
+OUT=$("$DENT" rollback 1)
+contains "$OUT" 'dent #2 · <auto> · saved before rollback'
+contains "$OUT" 'back to #1 · restored'
+equals "$(<file.txt)" one
+[ ! -f added.txt ]
+contains "$("$DENT" list)" '#2 · <auto>'
+"$DENT" rollback 2 >/dev/null
+equals "$(<file.txt)" two
+equals "$(<added.txt)" added
+contains "$("$DENT" diff 2 file.txt)" 'no changes'
+rm added.txt
+contains "$("$DENT" diff 2)" '- added.txt'
 
-assert_exit_fail() {
-    if eval "$1" >/dev/null 2>&1; then fail "$2" "expected non-zero exit"; else pass "$2"; fi
-}
+# A single-file rollback changes only that file, without auto-saving.
+new_dir
+echo original > a.txt
+echo original > b.txt
+"$DENT" >/dev/null
+echo changed > a.txt
+echo changed > b.txt
+contains "$("$DENT" rollback 1 a.txt)" 'back to #1 · a.txt'
+equals "$(<a.txt)" original
+equals "$(<b.txt)" changed
+contains "$("$DENT" list)" '1 of 1 dents'
 
-assert_file_eq() {
-    if cmp -s "$1" "$2"; then pass "$3"; else fail "$3" "files differ: $1 vs $2"; fi
-}
+# Smart auto-save skips duplicates and retains at most one <auto>.
+new_dir
+echo one > f
+"$DENT" one >/dev/null
+echo two > f
+"$DENT" two >/dev/null
+"$DENT" rollback 1 >/dev/null
+equals "$("$DENT" list | grep -c '<auto>' || true)" 0
+echo dirty > f
+"$DENT" rollback 2 >/dev/null
+echo dirtier > f
+"$DENT" rollback 1 >/dev/null
+equals "$("$DENT" list | grep -c '<auto>')" 1
 
-# ============================================================
-echo "=== Basic save & rollback ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "hello" > file.txt
-mkdir -p sub
-echo "nested" > sub/deep.txt
-
-OUT=$($CHECK 2>&1)
-assert_contains "$OUT" "checkpoint #1" "create first checkpoint"
-
-# modify files
-echo "changed" > file.txt
-echo "new" > added.txt
-rm sub/deep.txt
-
-$CHECK rollback 1 2>&1 >/dev/null
-assert_eq "$(cat file.txt)" "hello" "rollback file content"
-assert_eq "$(cat sub/deep.txt)" "nested" "rollback nested file"
-[ ! -f added.txt ] && pass "rollback removes added file" || fail "rollback removes added file" "added.txt still exists"
-
-# ============================================================
-echo "=== Save with --note ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "a" > f.txt
-
-OUT=$($CHECK --note "my note" 2>&1)
-assert_contains "$OUT" '"my note"' "save with note"
-
-OUT=$($CHECK list 2>&1)
-assert_contains "$OUT" "my note" "list shows note"
-
-# ============================================================
-echo "=== Note ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "a" > f.txt
-$CHECK >/dev/null 2>&1
-echo "b" > f.txt
-$CHECK >/dev/null 2>&1
-
-# Add note to existing checkpoint
-OUT=$($CHECK note 1 "first version" 2>&1)
-assert_contains "$OUT" '"first version"' "note output"
-
-OUT=$($CHECK list 2>&1)
-assert_contains "$OUT" "first version" "list shows added note"
-
-# Update existing note
-$CHECK note 1 "updated" 2>&1 >/dev/null
-OUT=$($CHECK list 2>&1)
-assert_contains "$OUT" "updated" "note can be updated"
-
-# Note on nonexistent checkpoint
-assert_exit_fail "cd $DIR && $CHECK note 99 'nope'" "note on nonexistent fails"
-
-# ============================================================
-echo "=== Version ==="
-# ============================================================
-
-OUT=$($CHECK version 2>&1)
-assert_contains "$OUT" "v0." "version output"
-
-OUT=$($CHECK --version 2>&1)
-assert_contains "$OUT" "v0." "--version flag"
-
-# ============================================================
-echo "=== Help ==="
-# ============================================================
-
-OUT=$($CHECK --help 2>&1)
-assert_contains "$OUT" "check" "help output"
-assert_contains "$OUT" "--note" "help mentions --note"
-assert_contains "$OUT" "rollback" "help mentions rollback"
-assert_contains "$OUT" "remove" "help mentions remove"
-
-# ============================================================
-echo "=== Diff (file list) ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "original" > keep.txt
-echo "old" > modify.txt
-echo "remove_me" > remove.txt
-$CHECK >/dev/null 2>&1
-
-echo "modified" > modify.txt
-echo "brand_new" > added.txt
-rm remove.txt
-
-OUT=$($CHECK diff 2>&1)
-assert_contains "$OUT" "diff current vs #1" "diff header"
-assert_contains "$OUT" "+ added.txt" "diff shows added"
-assert_contains "$OUT" "- remove.txt" "diff shows removed"
-assert_contains "$OUT" "~ modify.txt" "diff shows modified"
-
-# ============================================================
-echo "=== Diff (file content) ==="
-# ============================================================
-
-OUT=$($CHECK diff 1 modify.txt 2>&1)
-assert_contains "$OUT" "--- #1 modify.txt" "content diff header old"
-assert_contains "$OUT" "+++ current modify.txt" "content diff header new"
-assert_contains "$OUT" "-old" "content diff shows removed line"
-assert_contains "$OUT" "+modified" "content diff shows added line"
-
-# diff unchanged file
-echo "original" > keep.txt
-OUT=$($CHECK diff 1 keep.txt 2>&1)
-assert_contains "$OUT" "no changes" "diff unchanged file"
-
-# diff new file (not in snapshot)
-OUT=$($CHECK diff 1 added.txt 2>&1)
-assert_contains "$OUT" "+brand_new" "diff new file shows added"
-
-# ============================================================
-echo "=== Rollback auto-saves <auto> ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "v1" > f.txt
-$CHECK --note "snap1" >/dev/null 2>&1
-echo "v2" > f.txt
-$CHECK --note "snap2" >/dev/null 2>&1
-echo "v3-unsaved" > f.txt
-
-# Rollback to #1 should auto-save current state
-OUT=$($CHECK rollback 1 2>&1)
-assert_contains "$OUT" "<auto>" "rollback auto-saves <auto>"
-assert_contains "$OUT" "rolled back to #1" "rollback message"
-assert_eq "$(cat f.txt)" "v1" "rollback restores content"
-
-# The <auto> checkpoint should be in the list
-OUT=$($CHECK list 2>&1)
-assert_contains "$OUT" "<auto>" "list shows <auto> checkpoint"
-
-# Can rollback to <auto> to get unsaved state back
-AUTO_ID=$(echo "$OUT" | grep '<auto>' | head -1 | sed 's/#\([0-9]*\).*/\1/')
-$CHECK rollback "$AUTO_ID" 2>&1 >/dev/null
-assert_eq "$(cat f.txt)" "v3-unsaved" "rollback to <auto> restores unsaved state"
-
-# ============================================================
-echo "=== Rollback smart auto (skip duplicate) ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "v1" > f.txt
-$CHECK --note "snap1" >/dev/null 2>&1
-echo "v2" > f.txt
-$CHECK --note "snap2" >/dev/null 2>&1
-
-# Rollback to #1 — current state matches snap2, so <auto> should be skipped
-OUT=$($CHECK rollback 1 2>&1)
-assert_eq "$(cat f.txt)" "v1" "smart auto rollback restores content"
-# <auto> should NOT appear since current state == snap2
-OUT=$($CHECK list 2>&1)
-if echo "$OUT" | grep -qF "<auto>"; then
-    fail "smart auto skips duplicate" "<auto> should not appear"
-else
-    pass "smart auto skips duplicate"
-fi
-
-# ============================================================
-echo "=== Rollback only one <auto> ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "v1" > f.txt
-$CHECK --note "snap1" >/dev/null 2>&1
-echo "v2" > f.txt
-$CHECK --note "snap2" >/dev/null 2>&1
-echo "v3-dirty" > f.txt
-
-# First rollback creates <auto>
-$CHECK rollback 1 2>&1 >/dev/null
-echo "v4-dirty" > f.txt
-# Second rollback should replace old <auto>, not create a second one
-$CHECK rollback 2 2>&1 >/dev/null
-
-OUT=$($CHECK list 2>&1)
-AUTO_COUNT=$(echo "$OUT" | grep -cF "<auto>" || true)
-assert_eq "$AUTO_COUNT" "1" "only one <auto> exists after multiple rollbacks"
-
-# ============================================================
-echo "=== Rollback defaults to latest ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "v1" > f.txt
-$CHECK --note "snap1" >/dev/null 2>&1
-echo "v2" > f.txt
-$CHECK --note "snap2" >/dev/null 2>&1
-echo "v3-dirty" > f.txt
-
-OUT=$($CHECK rollback 2>&1)
-assert_contains "$OUT" "rolled back to latest" "rollback defaults to latest"
-assert_eq "$(cat f.txt)" "v2" "rollback latest restores snap2 content"
-
-# ============================================================
-echo "=== Remove ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "v1" > f.txt
-$CHECK --note "snap1" >/dev/null 2>&1
-echo "v2" > f.txt
-$CHECK --note "snap2" >/dev/null 2>&1
-echo "v3" > f.txt
-$CHECK --note "snap3" >/dev/null 2>&1
-
-OUT=$($CHECK remove 2 2>&1)
-assert_contains "$OUT" "removed #2" "remove message"
-
-# verify #2 is gone from list
-OUT=$($CHECK list 2>&1)
-if echo "$OUT" | grep -qF "snap2"; then
-    fail "remove deletes checkpoint" "snap2 still listed"
-else
-    pass "remove deletes checkpoint"
-fi
-assert_contains "$OUT" "snap1" "remove keeps other checkpoints (snap1)"
-assert_contains "$OUT" "snap3" "remove keeps other checkpoints (snap3)"
-
-# remove requires id
-# remove without args shows usage (exit 0)
-OUT=$($CHECK remove 2>&1)
-assert_contains "$OUT" "check remove" "remove without args shows usage in remove section"
-
-# remove nonexistent
-assert_exit_fail "cd $DIR && $CHECK remove 99" "remove nonexistent checkpoint fails"
-
-# ============================================================
-echo "=== List --recent ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
+# Latest rollback names its actual target; list limits and pruning.
+new_dir
 for i in 1 2 3 4 5; do
-    echo "v$i" > f.txt
-    $CHECK --note "snap$i" >/dev/null 2>&1
+    echo "v$i" > f
+    "$DENT" "step $i" >/dev/null
 done
+echo unsaved > f
+contains "$("$DENT" rollback)" 'back to #5 · restored'
+equals "$(<f)" v5
+contains "$("$DENT" remove 6)" 'removed #6 · working files unchanged'
+OUT=$("$DENT" list 2)
+contains "$OUT" '2 of 5 dents'
+contains "$OUT" '#5 · step 5'
+contains "$OUT" '#4 · step 4'
+if grep -qF 'step 3' <<< "$OUT"; then exit 1; fi
+contains "$("$DENT" remove --keep 2)" 'trimmed 3 dents · kept last 2'
+contains "$("$DENT" list)" '2 of 2 dents'
+fails "$DENT" remove --keep 0
+contains "$("$DENT" remove --keep 10)" 'trail unchanged · nothing to remove'
+contains "$(printf 'n\n' | "$DENT" remove all)" 'cancelled · trail unchanged'
+contains "$("$DENT" list)" '2 of 2 dents'
+OUT=$(printf 'y\n' | "$DENT" remove all)
+contains "$OUT" 'This erases your recovery trail, not working files.'
+contains "$OUT" 'removed all 2 dents · working files unchanged'
+equals "$(<f)" v5
+contains "$("$DENT" list)" 'no dents yet · leave one with `dent`'
+contains "$("$DENT" remove all)" 'trail empty · nothing to remove'
 
-OUT=$($CHECK list --recent 2 2>&1)
-assert_contains "$OUT" "snap5" "list --recent shows newest"
-assert_contains "$OUT" "snap4" "list --recent shows second"
-# snap3 should NOT appear
-if echo "$OUT" | grep -qF "snap3"; then
-    fail "list --recent limits output" "snap3 should not appear"
-else
-    pass "list --recent limits output"
-fi
+# Empty, binary and deeply nested files survive rollback.
+new_dir
+touch empty
+mkdir -p a/b/c
+echo nested > a/b/c/file
+dd if=/dev/urandom of=binary bs=1024 count=100 2>/dev/null
+cp binary "$ROOT/original-binary"
+"$DENT" >/dev/null
+echo filled > empty
+rm -r a
+echo changed > binary
+"$DENT" rollback 1 >/dev/null
+[ ! -s empty ]
+equals "$(<a/b/c/file)" nested
+cmp binary "$ROOT/original-binary"
 
-# full list shows all
-OUT=$($CHECK list 2>&1)
-assert_contains "$OUT" "snap1" "full list shows oldest"
-assert_contains "$OUT" "snap5" "full list shows newest"
-
-# ============================================================
-echo "=== Remove --keep ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-for i in 1 2 3 4 5; do
-    echo "v$i" > f.txt
-    $CHECK --note "snap$i" >/dev/null 2>&1
-done
-
-OUT=$($CHECK remove --keep 2 2>&1)
-assert_contains "$OUT" "removed 3" "remove --keep removes correct count"
-assert_contains "$OUT" "kept last 2" "remove --keep reports kept count"
-
-# verify only last 2 remain in list
-OUT=$($CHECK list 2>&1)
-assert_contains "$OUT" "snap5" "remove --keep keeps snap5"
-assert_contains "$OUT" "snap4" "remove --keep keeps snap4"
-if echo "$OUT" | grep -qF "snap3"; then
-    fail "remove --keep removes old checkpoints" "snap3 still listed"
-else
-    pass "remove --keep removes old checkpoints"
-fi
-
-# ============================================================
-echo "=== Remove --keep safety ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "x" > f.txt
-$CHECK >/dev/null 2>&1
-
-assert_exit_fail "cd $DIR && $CHECK remove --keep 0" "remove --keep 0 fails"
-
-# nothing to clean
-OUT=$($CHECK remove --keep 10 2>&1)
-assert_contains "$OUT" "nothing to clean" "remove --keep when nothing to do"
-
-# ============================================================
-echo "=== Remove usage ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "x" > f.txt
-$CHECK >/dev/null 2>&1
-
-OUT=$($CHECK remove 2>&1)
-assert_contains "$OUT" "check remove" "remove without args shows usage"
-
-# ============================================================
-echo "=== Remove all ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-for i in 1 2 3; do
-    echo "v$i" > f.txt
-    $CHECK --note "snap$i" >/dev/null 2>&1
-done
-
-# remove all with "y" confirmation
-OUT=$(echo "y" | $CHECK remove all 2>&1)
-assert_contains "$OUT" "removed all 3" "remove all confirms and removes"
-
-# list should show no checkpoints
-OUT=$($CHECK list 2>&1)
-assert_contains "$OUT" "no checkpoints" "no checkpoints after remove all"
-
-# remove all with "n" should abort
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "x" > f.txt
-$CHECK >/dev/null 2>&1
-OUT=$(echo "n" | $CHECK remove all 2>&1)
-assert_contains "$OUT" "aborted" "remove all aborts on n"
-# checkpoint should still exist
-OUT=$($CHECK list 2>&1)
-assert_contains "$OUT" "#1" "checkpoint survives abort"
-
-# ============================================================
-echo "=== Empty file ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-touch empty.txt
-$CHECK >/dev/null 2>&1
-echo "now has content" > empty.txt
-$CHECK rollback 1 2>&1 >/dev/null
-assert_eq "$(cat empty.txt)" "" "rollback empty file"
-
-# ============================================================
-echo "=== Binary file roundtrip ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-dd if=/dev/urandom of=binary.bin bs=1024 count=100 2>/dev/null
-cp binary.bin binary_orig.bin
-$CHECK >/dev/null 2>&1
-
-dd if=/dev/urandom of=binary.bin bs=1024 count=50 2>/dev/null
-$CHECK rollback 1 2>&1 >/dev/null
-assert_file_eq binary.bin binary_orig.bin "binary file roundtrip"
-
-# ============================================================
-echo "=== Nested directories ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-mkdir -p a/b/c/d
-echo "deep" > a/b/c/d/file.txt
-echo "mid" > a/b/mid.txt
-$CHECK >/dev/null 2>&1
-
-rm -rf a
-$CHECK rollback 1 2>&1 >/dev/null
-assert_eq "$(cat a/b/c/d/file.txt)" "deep" "rollback deep nested file"
-assert_eq "$(cat a/b/mid.txt)" "mid" "rollback mid nested file"
-
-# ============================================================
-echo "=== Multiple checkpoints rollback ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "v1" > f.txt
-$CHECK >/dev/null 2>&1
-echo "v2" > f.txt
-$CHECK >/dev/null 2>&1
-echo "v3" > f.txt
-$CHECK >/dev/null 2>&1
-
-$CHECK rollback 1 2>&1 >/dev/null
-assert_eq "$(cat f.txt)" "v1" "rollback to snap 1"
-$CHECK rollback 2 2>&1 >/dev/null
-assert_eq "$(cat f.txt)" "v2" "rollback to snap 2"
-$CHECK rollback 3 2>&1 >/dev/null
-assert_eq "$(cat f.txt)" "v3" "rollback to snap 3"
-
-# ============================================================
-echo "=== No checkpoints error ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-assert_exit_fail "cd $DIR && $CHECK rollback" "rollback with no checkpoints"
-assert_exit_fail "cd $DIR && $CHECK diff" "diff with no checkpoints"
-assert_exit_fail "cd $DIR && $CHECK list" "list with no checkpoints"
-assert_exit_fail "cd $DIR && $CHECK remove 1" "remove with no checkpoints"
-
-# ============================================================
-echo "=== List shows checkpoint path ==="
-# ============================================================
-
-DIR=$(new_test_dir)
-cd "$DIR"
-echo "x" > f.txt
-$CHECK >/dev/null 2>&1
-
-OUT=$($CHECK list 2>&1)
-assert_contains "$OUT" ".checkpoint-files/" "list shows checkpoint path"
-
-# ============================================================
-# Summary
-# ============================================================
-
-echo ""
-TOTAL=$((PASS + FAIL))
-if [ $FAIL -eq 0 ]; then
-    printf "\033[32mAll %d tests passed\033[0m\n" "$TOTAL"
-else
-    printf "\033[31m%d/%d tests failed\033[0m\n" "$FAIL" "$TOTAL"
-    exit 1
-fi
+# Multiple saved states remain reachable after successive rollbacks.
+new_dir
+for i in 1 2 3; do echo "$i" > f; "$DENT" >/dev/null; done
+for i in 1 2 3; do "$DENT" rollback "$i" >/dev/null; equals "$(<f)" "$i"; done
+printf 'All %d output assertions and file recovery checks passed.\n' "$PASS"

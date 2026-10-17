@@ -4,10 +4,10 @@ build:
 	zig build -Doptimize=ReleaseFast
 
 install: build
-	cp zig-out/bin/check /usr/local/bin/check
+	cp zig-out/bin/dent /usr/local/bin/dent
 
 uninstall:
-	rm -f /usr/local/bin/check
+	rm -f /usr/local/bin/dent
 
 test: build
 	zig build test
@@ -24,13 +24,14 @@ bench: build
 release:
 	rm -rf release && mkdir release
 	zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos
-	tar -czf release/check-macos-arm64.tar.gz -C zig-out/bin check
+	tar -czf release/dent-darwin-arm64.tar.gz -C zig-out/bin dent
 	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos
-	tar -czf release/check-macos-x86_64.tar.gz -C zig-out/bin check
-	zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux
-	tar -czf release/check-linux-arm64.tar.gz -C zig-out/bin check
-	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
-	tar -czf release/check-linux-x86_64.tar.gz -C zig-out/bin check
+	tar -czf release/dent-darwin-amd64.tar.gz -C zig-out/bin dent
+	zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu
+	tar -czf release/dent-linux-arm64.tar.gz -C zig-out/bin dent
+	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu
+	tar -czf release/dent-linux-amd64.tar.gz -C zig-out/bin dent
+	cd release && shasum -a 256 *.tar.gz > checksums.txt
 
 clean:
 	rm -rf zig-out .zig-cache bench-runner bench-runner.o release

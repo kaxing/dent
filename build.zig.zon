@@ -1,8 +1,8 @@
 .{
-    .name = .checkpoint,
-    .version = "0.0.0",
-    .fingerprint = 0xf00f7be0a0d8cd4,
-    .minimum_zig_version = "0.15.2",
+    .name = .dent,
+    .version = "0.0.5",
+    .fingerprint = 0x770a458fca23307a,
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zstd = .{
             .url = "git+https://github.com/allyourcodebase/zstd.git#e1a501be57f42c541e8a5597e4b59a074dfd09a3",
