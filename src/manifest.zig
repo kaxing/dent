@@ -6,6 +6,7 @@ const Dir = Io.Dir;
 const File = Io.File;
 
 const MAGIC = "CKP\x01";
+pub const MAX_NOTE_BYTES = 446;
 
 pub const Manifest = struct {
     id: u32,
@@ -17,11 +18,12 @@ pub const Manifest = struct {
 };
 
 pub fn write(dir: Dir, io: Io, m: Manifest) !void {
+    if (m.name.len > MAX_NOTE_BYTES) return error.NoteTooLong;
     var name_buf: [32]u8 = undefined;
     const filename = std.fmt.bufPrint(&name_buf, "{d}.manifest", .{m.id}) catch unreachable;
 
-    const file = try dir.createFile(io, filename, .{});
-    defer file.close(io);
+    var tmp_buf: [40]u8 = undefined;
+    const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{filename});
 
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
@@ -47,7 +49,10 @@ pub fn write(dir: Dir, io: Io, m: Manifest) !void {
     @memcpy(buf[pos..][0..32], &m.tree_hash);
     pos += 32;
 
+    const file = try dir.createFile(io, tmp_name, .{});
+    defer file.close(io);
     try file.writeStreamingAll(io, buf[0..pos]);
+    try Dir.rename(dir, tmp_name, dir, filename, io);
 }
 
 pub fn read(allocator: std.mem.Allocator, dir: Dir, io: Io, id: u32) !Manifest {
@@ -68,6 +73,7 @@ pub fn read(allocator: std.mem.Allocator, dir: Dir, io: Io, id: u32) !Manifest {
 
     const version = std.mem.readInt(u32, buf[pos..][0..4], .little);
     if (version != 1 and version != 2) return error.UnsupportedVersion;
+    if (n < @as(usize, if (version == 2) 66 else 58)) return error.InvalidManifest;
     pos += 4;
 
     var m: Manifest = undefined;
@@ -87,6 +93,7 @@ pub fn read(allocator: std.mem.Allocator, dir: Dir, io: Io, id: u32) !Manifest {
 
     const name_len = std.mem.readInt(u16, buf[pos..][0..2], .little);
     pos += 2;
+    if (name_len > n - pos - 32) return error.InvalidManifest;
     if (name_len > 0) {
         m.name = try allocator.dupe(u8, buf[pos..][0..name_len]);
         pos += name_len;
@@ -117,8 +124,8 @@ pub fn writeHead(dir: Dir, io: Io, id: u32) !void {
     const content = std.fmt.bufPrint(&buf, "{d}\n", .{id}) catch unreachable;
 
     const tmp = try dir.createFile(io, "latest.tmp", .{});
+    defer tmp.close(io);
     try tmp.writeStreamingAll(io, content);
-    tmp.close(io);
 
     try Dir.rename(dir, "latest.tmp", dir, "latest", io);
 }

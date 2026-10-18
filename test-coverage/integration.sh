@@ -33,23 +33,23 @@ new_dir
 contains "$("$DENT" --help)" 'dent — leave a dent.'
 contains "$("$DENT" --help)" 'Find your way in the file multiverse.'
 contains "$("$DENT" --help)" 'Travel can overwrite files'
-contains "$("$DENT" --help)" 'nearest .dent-files/'
+contains "$("$DENT" --help)" 'nearest .dent-history/'
 contains "$("$DENT" --help)" 'READ THE TRAIL'
 contains "$("$DENT" --help)" 'without auto-save'
-equals "$("$DENT" version)" 'v0.0.5'
-equals "$("$DENT" --version)" 'v0.0.5'
+equals "$("$DENT" version)" 'v0.0.6'
+equals "$("$DENT" --version)" 'v0.0.6'
 # Informational commands must not create storage.
-[ ! -d .dent-files ]
+[ ! -d .dent-history ]
 for command in travel diff list; do fails "$DENT" "$command"; done
 fails "$DENT" erase 1
 
 # Denting, notes, duplicate detection and storage.
 echo one > file.txt
 contains "$("$DENT" 'before the refactor')" 'dent #1 · before the refactor'
-[ -d .dent-files ]
+[ -d .dent-history ]
 contains "$("$DENT")" 'unchanged · already on your trail'
 contains "$("$DENT" list)" '1 of 1 dents'
-contains "$("$DENT" list)" '.dent-files/'
+contains "$("$DENT" list)" '.dent-history/'
 contains "$("$DENT" edit 1 'known good')" 'noted #1 · known good'
 contains "$("$DENT" list)" '#1 · known good'
 fails "$DENT" edit 99 nope

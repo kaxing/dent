@@ -1,5 +1,5 @@
 .zig-cache/
 zig-out/
-.dent-files/
+.dent-history/
 .DS_Store
 release/

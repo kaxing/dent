@@ -1,4 +1,5 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -16,15 +17,19 @@ pub fn build(b: *std.Build) void {
     });
 
     const zstd_dep = b.dependency("zstd", .{ .target = target, .optimize = optimize });
-    exe.root_module.linkLibrary(zstd_dep.artifact("zstd"));
+    const translator: Translator = .init(b.dependency("translate_c", .{}), .{
+        .c_source_file = b.path("src/c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translator.linkLibrary(zstd_dep.artifact("zstd"));
+    exe.root_module.addImport("c", translator.mod);
 
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run dent");
     run_step.dependOn(&run_cmd.step);
 
@@ -37,7 +42,7 @@ pub fn build(b: *std.Build) void {
     tree_module.addImport("hash.zig", hash_mod);
 
     const compress_mod = b.createModule(.{ .root_source_file = b.path("src/compress.zig"), .link_libc = true, .target = target });
-    compress_mod.linkLibrary(zstd_dep.artifact("zstd"));
+    compress_mod.addImport("c", translator.mod);
 
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{

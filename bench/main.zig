@@ -3,6 +3,7 @@ const chunker = @import("chunker.zig");
 
 const Blake3 = std.crypto.hash.Blake3;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+var io: std.Io = undefined;
 
 // ── Configuration ──
 
@@ -172,9 +173,9 @@ fn benchConfig(
     var save_ns: u64 = 0;
     var chunk_count: usize = 0;
     for (0..BENCH_ITERS) |_| {
-        var timer = try std.time.Timer.start();
+        const start = std.Io.Clock.awake.now(io);
         chunk_count = runSave(data1, config);
-        save_ns += timer.read();
+        save_ns += @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
     }
     const save_mbps = calcMbps(DATA_SIZE * BENCH_ITERS, save_ns);
 
@@ -185,9 +186,9 @@ fn benchConfig(
 
     var restore_ns: u64 = 0;
     for (0..BENCH_ITERS) |_| {
-        var timer = try std.time.Timer.start();
+        const start = std.Io.Clock.awake.now(io);
         _ = runRestore(data1, config);
-        restore_ns += timer.read();
+        restore_ns += @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
     }
     const restore_mbps = calcMbps(DATA_SIZE * BENCH_ITERS, restore_ns);
 
@@ -301,13 +302,12 @@ fn calcMbps(bytes: usize, ns: u64) f64 {
 fn print(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch &buf;
-    _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch {};
+    std.Io.File.stdout().writeStreamingAll(io, slice) catch {};
 }
 
-pub fn main() !void {
-    var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa_impl.deinit();
-    const allocator = gpa_impl.allocator();
+pub fn main(init: std.process.Init) !void {
+    io = init.io;
+    const allocator = init.gpa;
 
     print("\n=== Denting Algorithm Benchmark ===\n", .{});
     print("Data size: {d} MB, Iterations: {d}\n\n", .{ DATA_SIZE / (1024 * 1024), BENCH_ITERS });
@@ -327,7 +327,7 @@ pub fn main() !void {
     print("{s: <12} {s: <6}  {s: >10} {s: >10} {s: >10} {s: >7}\n", .{
         "Chunker", "Hash", "Dent MB/s", "Back MB/s", "Avg Chunk", "Dedup",
     });
-    print("{s}\n", .{"-" ** 62});
+    print("{s}\n", .{&@as([62]u8, @splat('-'))});
 
     const chunker_kinds = [_]ChunkerKind{ .fixed_4k, .fixed_8k, .fixed_16k, .fastcdc };
     const hash_kinds = [_]HashKind{ .blake3, .sha256 };
@@ -361,6 +361,6 @@ pub fn main() !void {
 
     print("\nNotes:\n", .{});
     print("  - Dedup: unique/total chunks across 2 dents w/ 1% edits (lower=better)\n", .{});
-    print("  - Compression not benchmarked: Zig 0.15 stdlib deflate compressor is incomplete,\n", .{});
-    print("    zstd has decompressor only. Will use C libzstd binding for production.\n\n", .{});
+    print("  - Synthetic chunking/hash measurements, not end-to-end CLI timings.\n", .{});
+    print("  - Compression and filesystem I/O are not benchmarked here.\n\n", .{});
 }

@@ -4,6 +4,11 @@ const chunker_mod = @import("chunker");
 const tree_mod = @import("tree");
 const comp = @import("compress");
 
+fn repeated(comptime text: []const u8, comptime count: usize) []const u8 {
+    const copies = comptime @as([count][text.len]u8, @splat(text[0..text.len].*));
+    return std.mem.asBytes(&copies);
+}
+
 // ── Hash tests ──
 
 test "hashBytes deterministic" {
@@ -46,7 +51,7 @@ test "HashContext consistent" {
 
 test "compress decompress roundtrip" {
     const allocator = std.testing.allocator;
-    const original = "The quick brown fox jumps over the lazy dog. " ** 10;
+    const original = repeated("The quick brown fox jumps over the lazy dog. ", 10);
 
     const compressed = try comp.compress(allocator, original);
     defer allocator.free(compressed);
@@ -70,6 +75,13 @@ test "compress decompress empty" {
     try std.testing.expectEqual(@as(usize, 0), decompressed.len);
 }
 
+test "decompress rejects an incorrect declared size" {
+    const allocator = std.testing.allocator;
+    const compressed = try comp.compress(allocator, "dent");
+    defer allocator.free(compressed);
+    try std.testing.expectError(error.ZstdError, comp.decompress(allocator, compressed, 5));
+}
+
 test "compress decompress binary data" {
     const allocator = std.testing.allocator;
     var original: [1024]u8 = undefined;
@@ -89,7 +101,7 @@ test "compress decompress binary data" {
 // ── Chunker tests ──
 
 test "chunker deterministic" {
-    const data = "abcdefgh" ** 2000;
+    const data = repeated("abcdefgh", 2000);
     var cdc1 = chunker_mod.FastCDC.init(data, .{});
     var cdc2 = chunker_mod.FastCDC.init(data, .{});
 
@@ -104,7 +116,7 @@ test "chunker deterministic" {
 }
 
 test "chunker covers all data" {
-    const data = "x" ** 50000;
+    const data = repeated("x", 50000);
     var cdc = chunker_mod.FastCDC.init(data, .{});
     var total: usize = 0;
     var prev_end: usize = 0;
@@ -118,7 +130,7 @@ test "chunker covers all data" {
 }
 
 test "chunker respects min size" {
-    const data = "y" ** 50000;
+    const data = repeated("y", 50000);
     var cdc = chunker_mod.FastCDC.init(data, .{});
     var count: usize = 0;
 
@@ -133,7 +145,7 @@ test "chunker respects min size" {
 }
 
 test "chunker respects max size" {
-    const data = "z" ** 200000;
+    const data = repeated("z", 200000);
     var cdc = chunker_mod.FastCDC.init(data, .{});
 
     while (cdc.next()) |chunk| {
@@ -232,10 +244,10 @@ test "tree serialize deserialize no chunks" {
 
 test "chunk hash compress decompress roundtrip" {
     const allocator = std.testing.allocator;
-    const original = "Hello, world! This is a test of the chunking pipeline. " ** 100;
+    const original = repeated("Hello, world! This is a test of the chunking pipeline. ", 100);
 
     var cdc = chunker_mod.FastCDC.init(original, .{});
-    var reconstructed: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
+    var reconstructed: std.ArrayList(u8) = .empty;
     defer reconstructed.deinit(allocator);
 
     while (cdc.next()) |chunk| {

@@ -10,12 +10,11 @@ const comp = @import("compress.zig");
 const Hash = hash_mod.Hash;
 const Io = std.Io;
 const Dir = Io.Dir;
-const DENT_DIR = ".dent-files";
-const MAX_SNAPSHOTS = 50;
+const DENT_DIR = ".dent-history";
+pub const MAX_DENTS = 50;
 
 const FileResult = struct {
     chunks: []ChunkResult,
-    failed: bool,
 };
 
 const ChunkResult = struct {
@@ -91,6 +90,7 @@ pub const Repo = struct {
     // ── Save ──
 
     pub fn save(self: *Repo, name: ?[]const u8) !u32 {
+        if (name) |note| if (note.len > manifest_mod.MAX_NOTE_BYTES) return error.NoteTooLong;
         var walker = try walker_mod.Walker.init(self.allocator, self.root, self.io);
         defer walker.deinit();
         const walk_entries = try walker.walk(self.root, self.io);
@@ -105,6 +105,7 @@ pub const Repo = struct {
 
         // Read + chunk + hash + compress changed files
         const file_results = try self.allocator.alloc(FileResult, walk_entries.len);
+        @memset(file_results, .{ .chunks = &.{} });
         defer {
             for (file_results) |fr| {
                 for (fr.chunks) |cr| self.allocator.free(cr.compressed);
@@ -116,10 +117,7 @@ pub const Repo = struct {
         const reused = try self.allocator.alloc(?[]const Hash, walk_entries.len);
         defer self.allocator.free(reused);
 
-        for (file_results, 0..) |*fr, i| {
-            fr.* = .{ .chunks = &.{}, .failed = true };
-            reused[i] = null;
-        }
+        @memset(reused, null);
 
         for (walk_entries, 0..) |we, i| {
             if (prev_tree) |pt| {
@@ -130,11 +128,12 @@ pub const Repo = struct {
                     }
                 }
             }
-            processFileForSave(self.allocator, self.root, self.io, we.path, &file_results[i]);
+            try processFileForSave(self.allocator, self.root, self.io, we.path, &file_results[i]);
         }
 
         // Sequential: write new chunks to pack + build tree
-        var tree_entries = try self.allocator.alloc(tree_mod.TreeEntry, walk_entries.len);
+        const tree_entries = try self.allocator.alloc(tree_mod.TreeEntry, walk_entries.len);
+        for (tree_entries) |*entry| entry.chunk_hashes = &.{};
         defer {
             for (tree_entries, 0..) |te, i| {
                 if (reused[i] == null and te.chunk_hashes.len > 0)
@@ -146,30 +145,29 @@ pub const Repo = struct {
         for (walk_entries, 0..) |we, i| {
             if (reused[i]) |prev_hashes| {
                 tree_entries[i] = .{
-                    .path = we.path, .mode = we.mode, .size = we.size,
-                    .mtime_ns = we.mtime_ns, .chunk_hashes = prev_hashes,
+                    .path = we.path,
+                    .mode = we.mode,
+                    .size = we.size,
+                    .mtime_ns = we.mtime_ns,
+                    .chunk_hashes = prev_hashes,
                 };
                 continue;
             }
 
             const fr = file_results[i];
-            if (fr.failed) {
-                tree_entries[i] = .{
-                    .path = we.path, .mode = we.mode, .size = 0,
-                    .mtime_ns = we.mtime_ns, .chunk_hashes = &.{},
-                };
-                continue;
-            }
-
             const hashes = try self.allocator.alloc(Hash, fr.chunks.len);
+            tree_entries[i].chunk_hashes = hashes;
             for (fr.chunks, 0..) |cr, j| {
                 hashes[j] = cr.hash;
                 try self.pack.writeChunkPreCompressed(cr.hash, cr.compressed, cr.raw_len);
             }
 
             tree_entries[i] = .{
-                .path = we.path, .mode = we.mode, .size = we.size,
-                .mtime_ns = we.mtime_ns, .chunk_hashes = hashes,
+                .path = we.path,
+                .mode = we.mode,
+                .size = we.size,
+                .mtime_ns = we.mtime_ns,
+                .chunk_hashes = hashes,
             };
         }
 
@@ -195,13 +193,11 @@ pub const Repo = struct {
 
         try manifest_mod.writeHead(self.cp_dir, self.io, next_id);
 
-        if (next_id > MAX_SNAPSHOTS) self.prune(next_id) catch {};
-
         return next_id;
     }
 
-    fn processFileForSave(allocator: std.mem.Allocator, root: Dir, io: Io, path: []const u8, result: *FileResult) void {
-        const data = root.readFileAlloc(io, path, allocator, .limited(256 * 1024 * 1024)) catch return;
+    fn processFileForSave(allocator: std.mem.Allocator, root: Dir, io: Io, path: []const u8, result: *FileResult) !void {
+        const data = try root.readFileAlloc(io, path, allocator, .limited(256 * 1024 * 1024));
         defer allocator.free(data);
 
         var chunk_count: usize = 0;
@@ -210,20 +206,20 @@ pub const Repo = struct {
             while (cdc.next()) |_| chunk_count += 1;
         }
 
-        const chunks = allocator.alloc(ChunkResult, chunk_count) catch return;
+        const chunks = try allocator.alloc(ChunkResult, chunk_count);
         var idx: usize = 0;
+        errdefer {
+            for (chunks[0..idx]) |cr| allocator.free(cr.compressed);
+            allocator.free(chunks);
+        }
         var cdc = chunker_mod.FastCDC.init(data, .{});
         while (cdc.next()) |chunk| {
             const h = hash_mod.hashBytes(chunk.data);
-            const compressed = comp.compress(allocator, chunk.data) catch {
-                for (chunks[0..idx]) |cr| allocator.free(cr.compressed);
-                allocator.free(chunks);
-                return;
-            };
+            const compressed = try comp.compress(allocator, chunk.data);
             chunks[idx] = .{ .hash = h, .compressed = compressed, .raw_len = @intCast(chunk.data.len) };
             idx += 1;
         }
-        result.* = .{ .chunks = chunks, .failed = false };
+        result.* = .{ .chunks = chunks };
     }
 
     // ── Restore ──
@@ -239,7 +235,20 @@ pub const Repo = struct {
         const entries = try tree_mod.deserialize(self.allocator, tree_data);
         defer tree_mod.freeEntries(self.allocator, entries);
 
-        // Delete files not in the target dent
+        // Read and validate the entire destination before changing working files.
+        const file_contents = try self.allocator.alloc([]u8, entries.len);
+        var loaded: usize = 0;
+        defer {
+            for (file_contents[0..loaded]) |content| self.allocator.free(content);
+            self.allocator.free(file_contents);
+        }
+        for (entries, 0..) |entry, i| {
+            try self.checkRestorePath(entry.path);
+            file_contents[i] = try self.readEntry(entry);
+            loaded += 1;
+        }
+
+        // Delete files not in the target dent.
         var walker = try walker_mod.Walker.init(self.allocator, self.root, self.io);
         defer walker.deinit();
         const current_files = try walker.walk(self.root, self.io);
@@ -250,63 +259,15 @@ pub const Repo = struct {
 
         for (current_files) |cf| {
             if (findEntry(entries, cf.path) == null) {
-                self.root.deleteFile(self.io, cf.path) catch {};
+                try self.root.deleteFile(self.io, cf.path);
             }
         }
 
-        // Read all file contents from pack (sequential reads)
-        const file_contents = try self.allocator.alloc(?[]u8, entries.len);
-        @memset(file_contents, null);
-        defer {
-            for (file_contents) |fc| if (fc) |c| self.allocator.free(c);
-            self.allocator.free(file_contents);
+        // Clear empty former directories before restoring files at those paths.
+        try self.cleanEmptyDirs();
+        for (entries, file_contents) |entry, content| {
+            try self.writeRestoredFile(entry.path, content);
         }
-
-        for (entries, 0..) |entry, i| {
-            if (walker_mod.isProtected(entry.path)) {
-                file_contents[i] = null;
-                continue;
-            }
-            if (entry.chunk_hashes.len == 0) {
-                file_contents[i] = try self.allocator.alloc(u8, 0);
-                continue;
-            }
-
-            var total_size: usize = 0;
-            var valid = true;
-            for (entry.chunk_hashes) |h| {
-                const e = self.pack.getEntry(h) orelse { valid = false; break; };
-                total_size += e.raw_len;
-            }
-            if (!valid) { file_contents[i] = null; continue; }
-
-            const buf = self.allocator.alloc(u8, total_size) catch { file_contents[i] = null; continue; };
-            var pos: usize = 0;
-            var ok = true;
-            for (entry.chunk_hashes) |h| {
-                const chunk_data = self.pack.readChunk(h) catch { ok = false; break; };
-                defer self.allocator.free(chunk_data);
-                @memcpy(buf[pos..][0..chunk_data.len], chunk_data);
-                pos += chunk_data.len;
-            }
-            file_contents[i] = if (ok) buf else blk: { self.allocator.free(buf); break :blk null; };
-        }
-
-        // Write files
-        for (entries, 0..) |entry, i| {
-            if (file_contents[i] == null) continue;
-            if (std.fs.path.dirname(entry.path)) |dp| self.root.createDirPath(self.io, dp) catch {};
-        }
-
-        for (entries, 0..) |entry, i| {
-            if (file_contents[i]) |content| {
-                const file = self.root.createFile(self.io, entry.path, .{}) catch continue;
-                file.writeStreamingAll(self.io, content) catch {};
-                file.close(self.io);
-            }
-        }
-
-        self.cleanEmptyDirs() catch {};
     }
 
     pub fn restoreFile(self: *Repo, target_id: u32, path: []const u8) !void {
@@ -321,34 +282,10 @@ pub const Repo = struct {
 
         const entry = findEntry(entries, path) orelse return error.FileNotFound;
 
-        // Read file content from pack
-        if (entry.chunk_hashes.len == 0) {
-            if (std.fs.path.dirname(path)) |dp| try self.root.createDirPath(self.io, dp);
-            const file = try self.root.createFile(self.io, path, .{});
-            file.close(self.io);
-            return;
-        }
-
-        var total_size: usize = 0;
-        for (entry.chunk_hashes) |h| {
-            const e = self.pack.getEntry(h) orelse return error.MissingChunk;
-            total_size += e.raw_len;
-        }
-
-        const buf = try self.allocator.alloc(u8, total_size);
-        defer self.allocator.free(buf);
-        var pos: usize = 0;
-        for (entry.chunk_hashes) |h| {
-            const chunk_data = try self.pack.readChunk(h);
-            defer self.allocator.free(chunk_data);
-            @memcpy(buf[pos..][0..chunk_data.len], chunk_data);
-            pos += chunk_data.len;
-        }
-
-        if (std.fs.path.dirname(path)) |dp| try self.root.createDirPath(self.io, dp);
-        const file = try self.root.createFile(self.io, path, .{});
-        defer file.close(self.io);
-        try file.writeStreamingAll(self.io, buf);
+        try self.checkRestorePath(path);
+        const content = try self.readEntry(entry);
+        defer self.allocator.free(content);
+        try self.writeRestoredFile(path, content);
     }
 
     // ── Diff ──
@@ -362,33 +299,46 @@ pub const Repo = struct {
         const tree_data = try self.pack.readChunk(m.tree_hash);
         defer self.allocator.free(tree_data);
         const old_entries = try tree_mod.deserialize(self.allocator, tree_data);
+        errdefer tree_mod.freeEntries(self.allocator, old_entries);
 
         var walker = try walker_mod.Walker.init(self.allocator, self.root, self.io);
         defer walker.deinit();
         const walk_entries = try walker.walk(self.root, self.io);
+        errdefer {
+            for (walk_entries) |entry| self.allocator.free(entry.path);
+            self.allocator.free(walk_entries);
+        }
 
         // Hash changed files, skip unchanged via mtime+size
-        var new_entries = try self.allocator.alloc(tree_mod.TreeEntry, walk_entries.len);
+        const new_entries = try self.allocator.alloc(tree_mod.TreeEntry, walk_entries.len);
+        for (new_entries) |*entry| entry.chunk_hashes = &.{};
+        errdefer {
+            for (new_entries) |entry| self.allocator.free(entry.chunk_hashes);
+            self.allocator.free(new_entries);
+        }
 
         for (walk_entries, 0..) |we, i| {
             if (findEntry(old_entries, we.path)) |old| {
                 if (old.size == we.size and old.mtime_ns == we.mtime_ns) {
                     // Copy hashes so each tree owns its own memory
-                    const hashes_copy = self.allocator.dupe(Hash, old.chunk_hashes) catch &.{};
+                    const hashes_copy = try self.allocator.dupe(Hash, old.chunk_hashes);
                     new_entries[i] = .{
-                        .path = we.path, .mode = we.mode, .size = we.size,
-                        .mtime_ns = we.mtime_ns, .chunk_hashes = hashes_copy,
+                        .path = we.path,
+                        .mode = we.mode,
+                        .size = we.size,
+                        .mtime_ns = we.mtime_ns,
+                        .chunk_hashes = hashes_copy,
                     };
                     continue;
                 }
             }
-            processFileForDiff(self.allocator, self.root, self.io, we, &new_entries[i]);
+            try processFileForDiff(self.allocator, self.root, self.io, we, &new_entries[i]);
         }
 
         // Merge-walk comparison
-        var added: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
-        var removed: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
-        var modified: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
+        var added: std.ArrayList([]const u8) = .empty;
+        var removed: std.ArrayList([]const u8) = .empty;
+        var modified: std.ArrayList([]const u8) = .empty;
 
         var oi: usize = 0;
         var ni: usize = 0;
@@ -406,8 +356,14 @@ pub const Repo = struct {
             } else {
                 const cmp = std.mem.order(u8, old_entries[oi].path, new_entries[ni].path);
                 switch (cmp) {
-                    .lt => { try removed.append(self.allocator, try self.allocator.dupe(u8, old_entries[oi].path)); oi += 1; },
-                    .gt => { try added.append(self.allocator, try self.allocator.dupe(u8, new_entries[ni].path)); ni += 1; },
+                    .lt => {
+                        try removed.append(self.allocator, try self.allocator.dupe(u8, old_entries[oi].path));
+                        oi += 1;
+                    },
+                    .gt => {
+                        try added.append(self.allocator, try self.allocator.dupe(u8, new_entries[ni].path));
+                        ni += 1;
+                    },
                     .eq => {
                         if (!hashListEqual(old_entries[oi].chunk_hashes, new_entries[ni].chunk_hashes))
                             try modified.append(self.allocator, try self.allocator.dupe(u8, new_entries[ni].path));
@@ -429,10 +385,10 @@ pub const Repo = struct {
         };
     }
 
-    fn processFileForDiff(allocator: std.mem.Allocator, root: Dir, io: Io, we: walker_mod.WalkEntry, result: *tree_mod.TreeEntry) void {
+    fn processFileForDiff(allocator: std.mem.Allocator, root: Dir, io: Io, we: walker_mod.WalkEntry, result: *tree_mod.TreeEntry) !void {
         result.* = .{ .path = we.path, .mode = we.mode, .size = we.size, .mtime_ns = we.mtime_ns, .chunk_hashes = &.{} };
 
-        const data = root.readFileAlloc(io, we.path, allocator, .limited(256 * 1024 * 1024)) catch return;
+        const data = try root.readFileAlloc(io, we.path, allocator, .limited(256 * 1024 * 1024));
         defer allocator.free(data);
 
         var count: usize = 0;
@@ -440,7 +396,7 @@ pub const Repo = struct {
             var cdc = chunker_mod.FastCDC.init(data, .{});
             while (cdc.next()) |_| count += 1;
         }
-        const hashes = allocator.alloc(Hash, count) catch return;
+        const hashes = try allocator.alloc(Hash, count);
         var idx: usize = 0;
         var cdc = chunker_mod.FastCDC.init(data, .{});
         while (cdc.next()) |chunk| {
@@ -456,12 +412,19 @@ pub const Repo = struct {
         const head = try manifest_mod.readHead(self.cp_dir, self.io);
         if (head == null) return &.{};
 
-        var manifests: std.ArrayList(manifest_mod.Manifest) = .{ .items = &.{}, .capacity = 0 };
-        errdefer manifests.deinit(self.allocator);
+        var manifests: std.ArrayList(manifest_mod.Manifest) = .empty;
+        errdefer {
+            for (manifests.items) |m| if (m.name.len > 0) self.allocator.free(m.name);
+            manifests.deinit(self.allocator);
+        }
 
         var id: u32 = 1;
         while (id <= head.?) : (id += 1) {
-            const m = manifest_mod.read(self.allocator, self.manifests_dir, self.io, id) catch continue;
+            const m = manifest_mod.read(self.allocator, self.manifests_dir, self.io, id) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            errdefer if (m.name.len > 0) self.allocator.free(m.name);
             try manifests.append(self.allocator, m);
         }
 
@@ -480,28 +443,43 @@ pub const Repo = struct {
         return tree_mod.deserialize(self.allocator, tree_data) catch null;
     }
 
-    fn prune(self: *Repo, current_id: u32) !void {
-        if (current_id <= MAX_SNAPSHOTS) return;
-        const delete_up_to = current_id - MAX_SNAPSHOTS;
-        self.deleteManifestsUpTo(delete_up_to);
-    }
-
-    pub fn pruneKeepLast(self: *Repo, keep: u32) !u32 {
-        const head = try manifest_mod.readHead(self.cp_dir, self.io);
-        const head_id = head orelse return 0;
-        if (head_id <= keep) return 0;
-        const delete_up_to = head_id - keep;
-        self.deleteManifestsUpTo(delete_up_to);
-        return delete_up_to;
-    }
-
-    fn deleteManifestsUpTo(self: *Repo, up_to: u32) void {
-        var id: u32 = 1;
-        while (id <= up_to) : (id += 1) {
-            var name_buf: [32]u8 = undefined;
-            const filename = std.fmt.bufPrint(&name_buf, "{d}.manifest", .{id}) catch continue;
-            self.manifests_dir.deleteFile(self.io, filename) catch {};
+    pub fn erase(self: *Repo, id: u32) !void {
+        const dents = try self.list();
+        defer {
+            for (dents) |m| if (m.name.len > 0) self.allocator.free(m.name);
+            self.allocator.free(dents);
         }
+        var found = false;
+        var latest: ?u32 = null;
+        for (dents) |m| {
+            if (m.id == id) found = true else latest = m.id;
+        }
+        if (!found) return error.FileNotFound;
+        var name_buf: [32]u8 = undefined;
+        const filename = try std.fmt.bufPrint(&name_buf, "{d}.manifest", .{id});
+        try self.manifests_dir.deleteFile(self.io, filename);
+        if (latest) |last| {
+            try manifest_mod.writeHead(self.cp_dir, self.io, last);
+        } else {
+            try self.cp_dir.deleteFile(self.io, "latest");
+        }
+    }
+
+    pub fn pruneKeepLast(self: *Repo, keep: u32, protected_id: ?u32) !u32 {
+        const dents = try self.list();
+        defer {
+            for (dents) |m| if (m.name.len > 0) self.allocator.free(m.name);
+            self.allocator.free(dents);
+        }
+        const excess = dents.len -| keep;
+        var deleted: u32 = 0;
+        for (dents) |m| {
+            if (deleted == excess) break;
+            if (protected_id == m.id) continue;
+            try self.erase(m.id);
+            deleted += 1;
+        }
+        return deleted;
     }
 
     /// Read a file as it was in a dent by reassembling its chunks
@@ -516,17 +494,18 @@ pub const Repo = struct {
 
         const entry = findEntry(entries, path) orelse return null;
 
-        if (entry.chunk_hashes.len == 0) {
-            return try self.allocator.alloc(u8, 0);
-        }
+        return try self.readEntry(entry);
+    }
 
+    fn readEntry(self: *Repo, entry: tree_mod.TreeEntry) ![]u8 {
         var total_size: usize = 0;
         for (entry.chunk_hashes) |h| {
             const e = self.pack.getEntry(h) orelse return error.ChunkNotFound;
-            total_size += e.raw_len;
+            total_size = try std.math.add(usize, total_size, e.raw_len);
         }
-
+        if (total_size != entry.size) return error.InvalidFileSize;
         const buf = try self.allocator.alloc(u8, total_size);
+        errdefer self.allocator.free(buf);
         var pos: usize = 0;
         for (entry.chunk_hashes) |h| {
             const chunk_data = try self.pack.readChunk(h);
@@ -537,11 +516,41 @@ pub const Repo = struct {
         return buf;
     }
 
+    fn checkRestorePath(self: *Repo, path: []const u8) !void {
+        if (std.fs.path.isAbsolute(path) or walker_mod.isProtected(path)) return error.ProtectedPath;
+        var components = std.mem.splitScalar(u8, path, '/');
+        var end: usize = 0;
+        while (components.next()) |part| {
+            if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.InvalidPath;
+            end += part.len;
+            const prefix = path[0..end];
+            end += 1;
+            const stat = self.root.statFile(self.io, prefix, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => continue,
+                else => return err,
+            };
+            if (stat.kind == .sym_link) return error.SymlinkInRestorePath;
+        }
+    }
+
+    fn writeRestoredFile(self: *Repo, path: []const u8, content: []const u8) !void {
+        try self.checkRestorePath(path);
+        if (std.fs.path.dirname(path)) |dp| try self.root.createDirPath(self.io, dp);
+        const stat = self.root.statFile(self.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (stat) |s| if (s.kind == .directory) try self.root.deleteDir(self.io, path);
+        const file = try self.root.createFile(self.io, path, .{});
+        defer file.close(self.io);
+        try file.writeStreamingAll(self.io, content);
+    }
+
     fn cleanEmptyDirs(self: *Repo) !void {
         var iter = try self.root.walkSelectively(self.allocator);
         defer iter.deinit();
 
-        var dirs: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
+        var dirs: std.ArrayList([]const u8) = .empty;
         defer {
             for (dirs.items) |d| self.allocator.free(d);
             dirs.deinit(self.allocator);
@@ -558,7 +567,10 @@ pub const Repo = struct {
         var i = dirs.items.len;
         while (i > 0) {
             i -= 1;
-            self.root.deleteDir(self.io, dirs.items[i]) catch {};
+            self.root.deleteDir(self.io, dirs.items[i]) catch |err| switch (err) {
+                error.DirNotEmpty => {},
+                else => return err,
+            };
         }
     }
 };

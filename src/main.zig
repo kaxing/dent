@@ -5,7 +5,7 @@ const manifest_mod = @import("manifest.zig");
 const Io = std.Io;
 const Dir = Io.Dir;
 
-const VERSION = "0.0.5";
+const VERSION = "0.0.6";
 
 const USAGE =
     \\dent — leave a dent.
@@ -35,7 +35,7 @@ const USAGE =
     \\  dent --help               show this guide
     \\
     \\Use numeric IDs from `dent list`. Paths are relative to this directory.
-    \\Uses the nearest .dent-files/ here or above, across that whole tree.
+    \\Uses the nearest .dent-history/ here or above, across that whole tree.
     \\Full travel leaves an <auto> dent of changed files before restoring.
     \\Travel can overwrite files and restore or remove nested dent histories.
     \\Erase deletes dents from your trail, not your working files.
@@ -79,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
         repo_path = discoverRoot(invocation_path) catch |e| fatal("repository discovery failed: {}", .{e});
         if (!std.mem.eql(u8, repo_path, invocation_path)) {
             var notice_buf: [4096]u8 = undefined;
-            const notice = std.fmt.bufPrint(&notice_buf, "tracking dents from parent · {s}/.dent-files/\n", .{repo_path}) catch "tracking dents from parent\n";
+            const notice = std.fmt.bufPrint(&notice_buf, "tracking dents from parent · {s}/.dent-history/\n", .{repo_path}) catch "tracking dents from parent\n";
             _ = std.c.write(2, notice.ptr, notice.len);
         }
     }
@@ -148,7 +148,6 @@ pub fn main(init: std.process.Init) !void {
         return doList(allocator, recent);
     }
 
-
     if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
         out("v{s}\n", .{VERSION});
         return;
@@ -187,7 +186,7 @@ extern fn statvfs(path: [*:0]const u8, buf: *Statvfs) c_int;
 fn checkDiskSpace() void {
     var buf: Statvfs = undefined;
     var path_buf: [4096]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}", .{repo_path}) catch return;
+    const path = std.mem.printSentinel(&path_buf, "{s}", .{repo_path}, 0) catch return;
     if (statvfs(path, &buf) != 0) return;
     if (buf.f_blocks > 0 and buf.f_bavail < buf.f_blocks >> 4) {
         fatal("disk almost full; denting paused", .{});
@@ -210,10 +209,7 @@ fn isDuplicateDent(allocator: std.mem.Allocator, r: *repo_mod.Repo, id: u32) boo
 }
 
 fn removeDuplicateDent(r: *repo_mod.Repo, id: u32) void {
-    var name_buf: [32]u8 = undefined;
-    const filename = std.fmt.bufPrint(&name_buf, "{d}.manifest", .{id}) catch unreachable;
-    r.manifests_dir.deleteFile(io(), filename) catch {};
-    if (id > 1) manifest_mod.writeHead(r.cp_dir, io(), id - 1) catch {};
+    r.erase(id) catch |e| fatal("failed to erase duplicate dent: {}", .{e});
 }
 
 fn discoverRoot(start: []const u8) ![]const u8 {
@@ -249,12 +245,13 @@ fn doSave(allocator: std.mem.Allocator, name: ?[]const u8) void {
     defer cwd.close(io());
     var r = repo_mod.Repo.openOrCreate(allocator, cwd, io()) catch |e| fatal("failed to open repo: {}", .{e});
     defer r.deinit();
-    const id = r.save(name) catch |e| fatal("could not leave a dent: {} (errno={})", .{ e, std.c._errno().* });
+    const id = r.save(name) catch |e| fatal("could not leave a dent: {}", .{e});
     if (isDuplicateDent(allocator, &r, id)) {
         removeDuplicateDent(&r, id);
         out("unchanged · already on your trail\n", .{});
         return;
     }
+    _ = r.pruneKeepLast(repo_mod.MAX_DENTS, null) catch |e| fatal("dent left, but trimming failed: {}", .{e});
     if (name) |n| {
         out("dent #{d} · {s}\n", .{ id, n });
     } else {
@@ -287,10 +284,12 @@ fn doTravel(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
         return;
     }
 
-    // Remove any existing <auto> dent (unless it's our target)
-    removeAutoDent(allocator, &r, target_id);
+    // Reject a missing or invalid destination before changing the trail.
+    const target = manifest_mod.read(allocator, r.manifests_dir, io(), target_id) catch |e|
+        fatal("cannot travel to dent #{d}: {}", .{ target_id, e });
+    defer if (target.name.len > 0) allocator.free(target.name);
 
-    // Auto-save current state
+    // Auto-save current state without pruning the destination or older recovery dents.
     const auto_id = r.save("<auto>") catch |e| fatal("could not leave a dent before travel: {}", .{e});
 
     if (isDuplicateDent(allocator, &r, auto_id)) {
@@ -299,28 +298,22 @@ fn doTravel(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
         out("dent #{d} · <auto> · left before travel\n", .{auto_id});
     }
 
-    r.restore(target_id) catch |e| fatal("travel failed: {}", .{e});
+    r.restore(target_id) catch |e| fatal("travel failed: {}; working files may be partially changed", .{e});
+    removeAutoDent(allocator, &r, target_id, auto_id);
+    _ = r.pruneKeepLast(repo_mod.MAX_DENTS, target_id) catch |e| fatal("files restored, but trimming failed: {}", .{e});
     out("back to #{d} · restored\n", .{target_id});
 }
 
-fn removeAutoDent(allocator: std.mem.Allocator, r: *repo_mod.Repo, skip_id: u32) void {
-    const manifests = r.list() catch return;
+fn removeAutoDent(allocator: std.mem.Allocator, r: *repo_mod.Repo, skip_id: u32, new_id: u32) void {
+    const manifests = r.list() catch |e| fatal("files restored, but reading auto dents failed: {}", .{e});
     defer {
         for (manifests) |m| if (m.name.len > 0) allocator.free(m.name);
         allocator.free(manifests);
     }
     for (manifests) |m| {
-        if (m.id == skip_id) continue;
+        if (m.id == skip_id or m.id == new_id) continue;
         if (std.mem.eql(u8, m.name, "<auto>")) {
-            var name_buf: [32]u8 = undefined;
-            const filename = std.fmt.bufPrint(&name_buf, "{d}.manifest", .{m.id}) catch continue;
-            r.manifests_dir.deleteFile(io(), filename) catch {};
-            // Update latest if this was the top
-            const head = manifest_mod.readHead(r.cp_dir, io()) catch continue;
-            if (head) |h| {
-                if (h == m.id and m.id > 1)
-                    manifest_mod.writeHead(r.cp_dir, io(), m.id - 1) catch {};
-            }
+            r.erase(m.id) catch |e| fatal("files restored, but erasing an old auto dent failed: {}", .{e});
         }
     }
 }
@@ -361,33 +354,10 @@ fn doErase(allocator: std.mem.Allocator, id: u32) void {
     };
     defer r.deinit();
 
-    // Check manifest exists
-    _ = manifest_mod.read(allocator, r.manifests_dir, io(), id) catch |err| {
+    r.erase(id) catch |err| {
         if (err == error.FileNotFound) fatal("dent #{d} not found", .{id});
-        fatal("failed to read dent #{d}: {}", .{ id, err });
+        fatal("failed to erase dent #{d}: {}", .{ id, err });
     };
-
-    // Delete the manifest file
-    var name_buf: [32]u8 = undefined;
-    const filename = std.fmt.bufPrint(&name_buf, "{d}.manifest", .{id}) catch unreachable;
-    r.manifests_dir.deleteFile(io(), filename) catch |e| fatal("failed to erase dent #{d}: {}", .{ id, e });
-
-    // If this was latest, update to previous existing manifest
-    const head = manifest_mod.readHead(r.cp_dir, io()) catch null;
-    if (head) |h| {
-        if (h == id) {
-            var prev = id;
-            while (prev > 1) {
-                prev -= 1;
-                var check_buf: [32]u8 = undefined;
-                const check_name = std.fmt.bufPrint(&check_buf, "{d}.manifest", .{prev}) catch continue;
-                if (r.manifests_dir.statFile(io(), check_name, .{})) |_| {
-                    manifest_mod.writeHead(r.cp_dir, io(), prev) catch {};
-                    break;
-                } else |_| continue;
-            }
-        }
-    }
 
     out("erased #{d} · working files unchanged\n", .{id});
 }
@@ -417,7 +387,10 @@ fn doDiff(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
 
         // Read current working tree version
         const current: ?[]u8 = blk: {
-            break :blk cwd.readFileAlloc(io(), p, allocator, .limited(256 * 1024 * 1024)) catch null;
+            break :blk cwd.readFileAlloc(io(), p, allocator, .limited(256 * 1024 * 1024)) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => fatal("failed to read working file: {}", .{err}),
+            };
         };
         defer if (current) |c| allocator.free(c);
 
@@ -476,7 +449,7 @@ fn doList(allocator: std.mem.Allocator, recent: ?u32) void {
     }
 
     // Print full path of dent storage
-    out("trail · {s}/.dent-files/\n", .{repo_path});
+    out("trail · {s}/.dent-history/\n", .{repo_path});
 
     // Print newest first, limited by recent
     const show_count = if (recent) |n| @min(n, manifests.len) else manifests.len;
@@ -507,7 +480,7 @@ fn doCleanup(allocator: std.mem.Allocator, keep: u32) void {
         fatal("failed to open repo: {}", .{err});
     };
     defer r.deinit();
-    const deleted = r.pruneKeepLast(keep) catch |e| fatal("cleanup failed: {}", .{e});
+    const deleted = r.pruneKeepLast(keep, null) catch |e| fatal("cleanup failed: {}", .{e});
     if (deleted == 0) {
         out("trail unchanged · nothing to erase\n", .{});
     } else {
@@ -547,21 +520,22 @@ fn doEraseAll(allocator: std.mem.Allocator) void {
     }
 
     for (manifests) |m| {
-        var name_buf: [32]u8 = undefined;
-        const filename = std.fmt.bufPrint(&name_buf, "{d}.manifest", .{m.id}) catch continue;
-        r.manifests_dir.deleteFile(io(), filename) catch {};
+        r.erase(m.id) catch |e| fatal("failed to erase dent #{d}: {}", .{ m.id, e });
     }
 
-    // Remove pack and latest
-    r.cp_dir.deleteFile(io(), "latest") catch {};
-    r.cp_dir.deleteFile(io(), "pack.dat") catch {};
-    r.cp_dir.deleteFile(io(), "pack.idx") catch {};
+    // The last erase clears latest. Remove stored chunks after all dents are gone.
+    for ([_][]const u8{ "pack.dat", "pack.idx" }) |path| {
+        r.cp_dir.deleteFile(io(), path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => fatal("failed to erase {s}: {}", .{ path, err }),
+        };
+    }
 
     out("erased all {d} dents · working files unchanged\n", .{manifests.len});
 }
 
 fn formatSize(bytes: u64) [8]u8 {
-    var buf: [8]u8 = .{' '} ** 8;
+    var buf: [8]u8 = @splat(' ');
     if (bytes == 0) {
         _ = std.fmt.bufPrint(&buf, "   0B   ", .{}) catch {};
     } else if (bytes < 1024) {
@@ -699,18 +673,30 @@ fn printSimpleDiff(allocator: std.mem.Allocator, old_text: []const u8, new_text:
     // Print with context lines (unified diff style)
     var idx: usize = 0;
     while (idx < op_count) {
-        if (ops[idx] == .keep) { idx += 1; continue; }
+        if (ops[idx] == .keep) {
+            idx += 1;
+            continue;
+        }
 
         const hunk_start = if (idx >= CONTEXT) idx - CONTEXT else 0;
         var print_idx = hunk_start;
 
         var end = idx;
         while (end < op_count) {
-            if (ops[end] != .keep) { end += 1; continue; }
+            if (ops[end] != .keep) {
+                end += 1;
+                continue;
+            }
             var keep_run: usize = 0;
             var scan = end;
-            while (scan < op_count and ops[scan] == .keep) { keep_run += 1; scan += 1; }
-            if (keep_run > CONTEXT * 2) { end += CONTEXT; break; }
+            while (scan < op_count and ops[scan] == .keep) {
+                keep_run += 1;
+                scan += 1;
+            }
+            if (keep_run > CONTEXT * 2) {
+                end += CONTEXT;
+                break;
+            }
             end = scan;
         }
         if (end > op_count) end = op_count;

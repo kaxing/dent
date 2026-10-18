@@ -12,14 +12,14 @@ mkdir -p "$ROOT/project/app/src" "$ROOT/project/ordinary/deep"
 cd "$ROOT/project/app"
 echo child-original > code
 "$DENT" child-one >/dev/null
-[ ! -e ../.dent-files ]
+[ ! -e ../.dent-history ]
 CHILD=$(pwd -P)
 # Root ignore patterns must not partially capture a nested history.
-echo opaque-data > .dent-files/example.idx
-cp -R .dent-files "$ROOT/child-history"
+echo opaque-data > .dent-history/example.idx
+cp -R .dent-history "$ROOT/child-history"
 cd ..
 echo parent-original > file
-printf '.dent-files/\n*.idx\nignored/\n' > .gitignore
+printf '.dent-history/\n*.idx\nignored/\n' > .gitignore
 mkdir ignored .git
 echo untracked > ignored/file
 echo git-metadata > .git/config
@@ -30,63 +30,63 @@ PARENT=$(pwd -P)
 
 # Deep invocation finds parent and prints a notice; file paths remain CWD-relative.
 cd ordinary/deep
-contains "$("$DENT" list 2>"$ROOT/notice")" "$PARENT/.dent-files/"
-contains "$(<"$ROOT/notice")" "tracking dents from parent · $PARENT/.dent-files/"
+contains "$("$DENT" list 2>"$ROOT/notice")" "$PARENT/.dent-history/"
+contains "$(<"$ROOT/notice")" "tracking dents from parent · $PARENT/.dent-history/"
 echo parent-changed > ../../file
 contains "$("$DENT" diff 1 ../../file)" '+parent-changed'
 "$DENT" travel 1 ../../file >/dev/null
 [ "$(<../../file)" = parent-original ]
 echo saved-from-deep > local
 "$DENT" parent-two >/dev/null
-[ ! -e .dent-files ]
-[ ! -e ../.dent-files ]
+[ ! -e .dent-history ]
+[ ! -e ../.dent-history ]
 contains "$("$DENT" list)" 'parent-two'
 fails "$DENT" travel 1 ../../../outside
 
 # An existing nearer child still selects its own trail.
 cd "$CHILD/src"
-contains "$("$DENT" list)" "$CHILD/.dent-files/"
+contains "$("$DENT" list)" "$CHILD/.dent-history/"
 contains "$("$DENT" list)" 'child-one'
 echo child-changed > ../code
 "$DENT" child-two >/dev/null
 cd "$PARENT"
 contains "$("$DENT" diff)" 'app/code'
-contains "$("$DENT" diff)" 'app/.dent-files/'
+contains "$("$DENT" diff)" 'app/.dent-history/'
 contains "$("$DENT" diff 1 app/code)" '+child-changed'
 # Nested metadata can be explicitly restored; active metadata cannot.
-echo changed-data > app/.dent-files/example.idx
-"$DENT" travel 1 app/.dent-files/example.idx >/dev/null
-[ "$(<app/.dent-files/example.idx)" = opaque-data ]
-fails "$DENT" travel 1 .dent-files/HEAD
-fails "$DENT" diff 1 .dent-files/HEAD
+echo changed-data > app/.dent-history/example.idx
+"$DENT" travel 1 app/.dent-history/example.idx >/dev/null
+[ "$(<app/.dent-history/example.idx)" = opaque-data ]
+fails "$DENT" travel 1 .dent-history/latest
+fails "$DENT" diff 1 .dent-history/latest
 
 # Travel from the parent restores child work and child history byte-for-byte.
 "$DENT" travel 1 >/dev/null
 [ "$(<app/code)" = child-original ]
-diff -r "$ROOT/child-history" app/.dent-files
+diff -r "$ROOT/child-history" app/.dent-history
 [ "$(<ignored/file)" = untracked ]
 [ "$(<.git/config)" = git-metadata ]
 contains "$("$DENT" list)" 'parent-one'
 contains "$("$DENT" diff 1)" 'no changes'
 # Delete nested history entirely, then recover it from the parent dent.
-mv app/.dent-files "$ROOT/removed-history"
-contains "$("$DENT" diff 1)" 'app/.dent-files/'
+mv app/.dent-history "$ROOT/removed-history"
+contains "$("$DENT" diff 1)" 'app/.dent-history/'
 "$DENT" travel 1 >/dev/null
-diff -r "$ROOT/child-history" app/.dent-files
+diff -r "$ROOT/child-history" app/.dent-history
 
 # A nested history created after the dent is removed by travel from the parent.
 mkdir later
-cp -R "$ROOT/child-history" later/.dent-files
+cp -R "$ROOT/child-history" later/.dent-history
 echo new-file > later/code
 "$DENT" travel 1 >/dev/null
 [ ! -e later ]
 
 # Broken nearest history is an error, not fallback or implicit initialization.
-mkdir -p broken/.dent-files broken/deep
+mkdir -p broken/.dent-history broken/deep
 cd broken/deep
 fails "$DENT" list
 fails "$DENT" should-not-initialize
-[ ! -e .dent-files ]
-[ ! -e ../.dent-files/manifests ]
+[ ! -e .dent-history ]
+[ ! -e ../.dent-history/manifests ]
 
 printf 'Discovery design test passed: upward lookup, parent notice, relative paths, nested history capture/restore/removal, active history protection.\n'

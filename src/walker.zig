@@ -5,7 +5,7 @@ const Dir = Io.Dir;
 
 // Stop discovery at a marker even when its history is incomplete or damaged.
 pub fn hasDent(dir: Dir, io: Io) !bool {
-    _ = dir.statFile(io, ".dent-files", .{ .follow_symlinks = false }) catch |err| switch (err) {
+    _ = dir.statFile(io, ".dent-history", .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -13,7 +13,7 @@ pub fn hasDent(dir: Dir, io: Io) !bool {
 }
 
 pub fn isProtected(path: []const u8) bool {
-    if (std.mem.eql(u8, path, ".dent-files") or std.mem.startsWith(u8, path, ".dent-files/")) return true;
+    if (std.mem.eql(u8, path, ".dent-history") or std.mem.startsWith(u8, path, ".dent-history/")) return true;
     var components = std.mem.splitScalar(u8, path, '/');
     while (components.next()) |part| {
         if (std.mem.eql(u8, part, ".git")) return true;
@@ -36,7 +36,7 @@ pub const Walker = struct {
     pub fn init(allocator: std.mem.Allocator, root: Dir, io: Io) !Walker {
         var w = Walker{
             .allocator = allocator,
-            .ignore_patterns = .{ .items = &.{}, .capacity = 0 },
+            .ignore_patterns = .empty,
             .patterns_start = 0,
         };
 
@@ -45,7 +45,11 @@ pub const Walker = struct {
         w.patterns_start = w.ignore_patterns.items.len;
 
         // Load .gitignore
-        w.loadIgnoreFile(root, io, ".gitignore") catch {};
+        errdefer w.deinit();
+        w.loadIgnoreFile(root, io, ".gitignore") catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
 
         return w;
     }
@@ -75,7 +79,7 @@ pub const Walker = struct {
     }
 
     pub fn walk(self: *Walker, root: Dir, io: Io) ![]WalkEntry {
-        var entries: std.ArrayList(WalkEntry) = .{ .items = &.{}, .capacity = 0 };
+        var entries: std.ArrayList(WalkEntry) = .empty;
         errdefer {
             for (entries.items) |e| self.allocator.free(e.path);
             entries.deinit(self.allocator);
@@ -93,10 +97,8 @@ pub const Walker = struct {
             if (entry.kind != .file) continue;
 
             const path = try self.allocator.dupe(u8, entry.path);
-            const stat = root.statFile(io, entry.path, .{}) catch {
-                self.allocator.free(path);
-                continue;
-            };
+            errdefer self.allocator.free(path);
+            const stat = try root.statFile(io, entry.path, .{});
 
             try entries.append(self.allocator, .{
                 .path = path,
@@ -118,10 +120,10 @@ pub const Walker = struct {
     fn isIgnored(self: *Walker, path: []const u8) bool {
         if (isProtected(path)) return true;
         // Nested histories travel with the files in a dent. Do not partially
-        // capture them because .gitignore contains .dent-files or *.idx, etc.
+        // capture them because .gitignore contains .dent-history or *.idx, etc.
         var components = std.mem.splitScalar(u8, path, '/');
         while (components.next()) |part| {
-            if (std.mem.eql(u8, part, ".dent-files")) return false;
+            if (std.mem.eql(u8, part, ".dent-history")) return false;
         }
         for (self.ignore_patterns.items) |pattern| {
             if (matchPattern(pattern, path)) return true;
