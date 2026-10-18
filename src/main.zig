@@ -8,13 +8,14 @@ const Dir = Io.Dir;
 const VERSION = "0.0.5";
 
 const USAGE =
-    \\dent — leave a dent. Find your way back.
+    \\dent — leave a dent.
     \\
-    \\A trail of local checkpoints for agents exploring a codebase.
+    \\Find your way in the file multiverse.
+    \\Follow an idea. Take a wrong turn. Keep a trail back.
     \\
     \\LEAVE A DENT
-    \\  dent                      save where you are
-    \\  dent "before the refactor" save with a note
+    \\  dent                      leave a dent here
+    \\  dent "before the refactor" leave a dent with a note
     \\
     \\READ THE TRAIL
     \\  dent list [N]             show all dents, or the last N
@@ -22,20 +23,23 @@ const USAGE =
     \\  dent edit <id> "note"     update a dent's note
     \\
     \\FIND YOUR WAY BACK
-    \\  dent rollback [id]        restore a dent (default: latest)
-    \\  dent rollback <id> <path> restore one file, without auto-save
+    \\  dent travel [id]          return to a dent (default: latest)
+    \\  dent travel <id> <path>   restore one file, without auto-save
     \\
-    \\TRIM THE TRAIL
-    \\  dent remove <id>          remove one dent
-    \\  dent remove --keep <N>    keep only the last N
-    \\  dent remove all           remove all dents (asks first)
+    \\ERASE DENTS
+    \\  dent erase <id>           erase one dent
+    \\  dent erase --keep <N>     erase all but the last N dents
+    \\  dent erase all            erase all dents (asks first)
     \\
     \\  dent version              show version
     \\  dent --help               show this guide
     \\
     \\Use numeric IDs from `dent list`. Paths are relative to this directory.
-    \\Full rollback saves changed working files as <auto> before restoring.
-    \\Dents are local recovery points, not a backup. Keep your Git history.
+    \\Uses the nearest .dent-files/ here or above, across that whole tree.
+    \\Full travel leaves an <auto> dent of changed files before restoring.
+    \\Travel can overwrite files and restore or remove nested dent histories.
+    \\Erase deletes dents from your trail, not your working files.
+    \\Dents hold local files, not conversations. Keep Git and off-device backups.
     \\
 ;
 
@@ -55,6 +59,8 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 var g_io: Io = undefined;
+var repo_path: []const u8 = ".";
+var invocation_path: [:0]const u8 = ".";
 
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
@@ -65,6 +71,20 @@ pub fn main(init: std.process.Init) !void {
 
     const cmd = args.next();
 
+    // Informational commands do not need repository discovery.
+    const informational = if (cmd) |c| std.mem.eql(u8, c, "version") or std.mem.eql(u8, c, "--version") or
+        std.mem.eql(u8, c, "-v") or std.mem.eql(u8, c, "help") or std.mem.eql(u8, c, "--help") or std.mem.eql(u8, c, "-h") else false;
+    if (!informational) {
+        invocation_path = try Dir.cwd().realPathFileAlloc(io(), ".", allocator);
+        repo_path = discoverRoot(invocation_path) catch |e| fatal("repository discovery failed: {}", .{e});
+        if (!std.mem.eql(u8, repo_path, invocation_path)) {
+            var notice_buf: [4096]u8 = undefined;
+            const notice = std.fmt.bufPrint(&notice_buf, "tracking dents from parent · {s}/.dent-files/\n", .{repo_path}) catch "tracking dents from parent\n";
+            _ = std.c.write(2, notice.ptr, notice.len);
+        }
+    }
+    defer if (!informational) allocator.free(invocation_path);
+
     // No args → save (create repo if needed)
     if (cmd == null) {
         return doSave(allocator, null);
@@ -72,11 +92,15 @@ pub fn main(init: std.process.Init) !void {
 
     const command = cmd.?;
 
-    if (std.mem.eql(u8, command, "rollback")) {
-        const id = parseOptionalId(args.next());
+    if (std.mem.eql(u8, command, "travel")) {
+        const id_arg = args.next();
+        const id = parseOptionalId(id_arg);
+        if (id_arg != null and id == null) fatal("usage: dent travel [id] [path] — id must be a number", .{});
         const path = args.next();
-        if (path != null and id == null) fatal("usage: dent rollback <id> <path>", .{});
-        return doRollback(allocator, id, path);
+        if (path != null and id == null) fatal("usage: dent travel <id> <path>", .{});
+        const relative = resolveFileArgument(allocator, path);
+        defer if (relative) |p| allocator.free(p);
+        return doTravel(allocator, id, relative);
     }
 
     if (std.mem.eql(u8, command, "edit")) {
@@ -86,15 +110,15 @@ pub fn main(init: std.process.Init) !void {
         return doNote(allocator, id, note);
     }
 
-    if (std.mem.eql(u8, command, "remove")) {
+    if (std.mem.eql(u8, command, "erase")) {
         const next = args.next() orelse {
-            out("dent remove <id>         remove a checkpoint\n", .{});
-            out("dent remove --keep N     delete all but last N\n", .{});
-            out("dent remove all          remove all checkpoints\n", .{});
+            out("dent erase <id>          erase a dent\n", .{});
+            out("dent erase --keep N      erase all but the last N dents\n", .{});
+            out("dent erase all           erase all dents (asks first)\n", .{});
             return;
         };
         if (std.mem.eql(u8, next, "all")) {
-            return doRemoveAll(allocator);
+            return doEraseAll(allocator);
         }
         if (std.mem.eql(u8, next, "--keep")) {
             const val = args.next() orelse fatal("--keep requires a number", .{});
@@ -102,15 +126,17 @@ pub fn main(init: std.process.Init) !void {
             if (keep == 0) fatal("--keep must be at least 1", .{});
             return doCleanup(allocator, keep);
         }
-        const id = std.fmt.parseInt(u32, next, 10) catch fatal("dent remove <id> — id must be a number", .{});
-        return doRemove(allocator, id);
+        const id = std.fmt.parseInt(u32, next, 10) catch fatal("dent erase <id> — id must be a number", .{});
+        return doErase(allocator, id);
     }
 
     if (std.mem.eql(u8, command, "diff")) {
         const next = args.next();
         const id = parseOptionalId(next);
         const path = if (id != null) args.next() else if (next != null and !isNumeric(next.?)) next else args.next();
-        return doDiff(allocator, id, path);
+        const relative = resolveFileArgument(allocator, path);
+        defer if (relative) |p| allocator.free(p);
+        return doDiff(allocator, id, relative);
     }
 
     if (std.mem.eql(u8, command, "list")) {
@@ -160,13 +186,15 @@ extern fn statvfs(path: [*:0]const u8, buf: *Statvfs) c_int;
 
 fn checkDiskSpace() void {
     var buf: Statvfs = undefined;
-    if (statvfs(".", &buf) != 0) return;
+    var path_buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}", .{repo_path}) catch return;
+    if (statvfs(path, &buf) != 0) return;
     if (buf.f_blocks > 0 and buf.f_bavail < buf.f_blocks >> 4) {
-        fatal("disk almost full, skipping checkpoint", .{});
+        fatal("disk almost full; denting paused", .{});
     }
 }
 
-fn isDuplicateCheckpoint(allocator: std.mem.Allocator, r: *repo_mod.Repo, id: u32) bool {
+fn isDuplicateDent(allocator: std.mem.Allocator, r: *repo_mod.Repo, id: u32) bool {
     const m = manifest_mod.read(allocator, r.manifests_dir, io(), id) catch return false;
     defer if (m.name.len > 0) allocator.free(m.name);
     const manifests = r.list() catch return false;
@@ -181,15 +209,37 @@ fn isDuplicateCheckpoint(allocator: std.mem.Allocator, r: *repo_mod.Repo, id: u3
     return false;
 }
 
-fn removeDuplicateCheckpoint(r: *repo_mod.Repo, id: u32) void {
+fn removeDuplicateDent(r: *repo_mod.Repo, id: u32) void {
     var name_buf: [32]u8 = undefined;
     const filename = std.fmt.bufPrint(&name_buf, "{d}.manifest", .{id}) catch unreachable;
     r.manifests_dir.deleteFile(io(), filename) catch {};
     if (id > 1) manifest_mod.writeHead(r.cp_dir, io(), id - 1) catch {};
 }
 
+fn discoverRoot(start: []const u8) ![]const u8 {
+    var candidate = start;
+    while (true) {
+        const dir = try Dir.cwd().openDir(io(), candidate, .{});
+        defer dir.close(io());
+        if (try @import("walker.zig").hasDent(dir, io())) return candidate;
+        candidate = std.fs.path.dirname(candidate) orelse return start;
+    }
+}
+
+fn resolveFileArgument(allocator: std.mem.Allocator, path: ?[]const u8) ?[]const u8 {
+    const p = path orelse return null;
+    const absolute = std.fs.path.resolve(allocator, &.{ invocation_path, p }) catch fatal("out of memory", .{});
+    defer allocator.free(absolute);
+    const relative = std.fs.path.relative(allocator, invocation_path, null, repo_path, absolute) catch fatal("out of memory", .{});
+    if (std.mem.eql(u8, relative, "..") or std.mem.startsWith(u8, relative, "../"))
+        fatal("path is outside the repository", .{});
+    if (@import("walker.zig").isProtected(relative))
+        fatal("path belongs to active dent or Git metadata", .{});
+    return relative;
+}
+
 fn openCwd() Dir {
-    return Dir.cwd().openDir(io(), ".", .{ .iterate = true }) catch
+    return Dir.cwd().openDir(io(), repo_path, .{ .iterate = true }) catch
         fatal("failed to open current directory", .{});
 }
 
@@ -199,24 +249,24 @@ fn doSave(allocator: std.mem.Allocator, name: ?[]const u8) void {
     defer cwd.close(io());
     var r = repo_mod.Repo.openOrCreate(allocator, cwd, io()) catch |e| fatal("failed to open repo: {}", .{e});
     defer r.deinit();
-    const id = r.save(name) catch |e| fatal("save failed: {} (errno={})", .{ e, std.c._errno().* });
-    if (isDuplicateCheckpoint(allocator, &r, id)) {
-        removeDuplicateCheckpoint(&r, id);
+    const id = r.save(name) catch |e| fatal("could not leave a dent: {} (errno={})", .{ e, std.c._errno().* });
+    if (isDuplicateDent(allocator, &r, id)) {
+        removeDuplicateDent(&r, id);
         out("unchanged · already on your trail\n", .{});
         return;
     }
     if (name) |n| {
         out("dent #{d} · {s}\n", .{ id, n });
     } else {
-        out("dent #{d} · saved\n", .{id});
+        out("dent #{d} · left here\n", .{id});
     }
 }
 
-fn doRollback(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
+fn doTravel(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
     const cwd = openCwd();
     defer cwd.close(io());
     var r = repo_mod.Repo.open(allocator, cwd, io()) catch |err| {
-        if (err == error.NotInitialized) fatal("no checkpoints found", .{});
+        if (err == error.NotInitialized) fatal("no dents yet; leave one with `dent`", .{});
         fatal("failed to open repo: {}", .{err});
     };
     defer r.deinit();
@@ -224,36 +274,36 @@ fn doRollback(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
     // Resolve target before auto-saving
     const target_id = id orelse blk: {
         const head = manifest_mod.readHead(r.cp_dir, io()) catch fatal("failed to read latest", .{});
-        break :blk head orelse fatal("no checkpoints found", .{});
+        break :blk head orelse fatal("no dents yet; leave one with `dent`", .{});
     };
 
-    // Single-file rollback: no auto-save, just restore the one file
+    // Single-file travel: no auto-save, just restore the one file
     if (path) |file_path| {
         r.restoreFile(target_id, file_path) catch |e| {
-            if (e == error.FileNotFound) fatal("file not in checkpoint #{d}: {s}", .{ target_id, file_path });
-            fatal("rollback failed: {}", .{e});
+            if (e == error.FileNotFound) fatal("file not in dent #{d}: {s}", .{ target_id, file_path });
+            fatal("travel failed: {}", .{e});
         };
         out("back to #{d} · {s}\n", .{ target_id, file_path });
         return;
     }
 
-    // Remove any existing <auto> checkpoint (unless it's our target)
-    removeAutoCheckpoint(allocator, &r, target_id);
+    // Remove any existing <auto> dent (unless it's our target)
+    removeAutoDent(allocator, &r, target_id);
 
     // Auto-save current state
-    const auto_id = r.save("<auto>") catch |e| fatal("failed to save current state: {}", .{e});
+    const auto_id = r.save("<auto>") catch |e| fatal("could not leave a dent before travel: {}", .{e});
 
-    if (isDuplicateCheckpoint(allocator, &r, auto_id)) {
-        removeDuplicateCheckpoint(&r, auto_id);
+    if (isDuplicateDent(allocator, &r, auto_id)) {
+        removeDuplicateDent(&r, auto_id);
     } else {
-        out("dent #{d} · <auto> · saved before rollback\n", .{auto_id});
+        out("dent #{d} · <auto> · left before travel\n", .{auto_id});
     }
 
-    r.restore(target_id) catch |e| fatal("rollback failed: {}", .{e});
+    r.restore(target_id) catch |e| fatal("travel failed: {}", .{e});
     out("back to #{d} · restored\n", .{target_id});
 }
 
-fn removeAutoCheckpoint(allocator: std.mem.Allocator, r: *repo_mod.Repo, skip_id: u32) void {
+fn removeAutoDent(allocator: std.mem.Allocator, r: *repo_mod.Repo, skip_id: u32) void {
     const manifests = r.list() catch return;
     defer {
         for (manifests) |m| if (m.name.len > 0) allocator.free(m.name);
@@ -279,14 +329,14 @@ fn doNote(allocator: std.mem.Allocator, id: u32, note: []const u8) void {
     const cwd = openCwd();
     defer cwd.close(io());
     var r = repo_mod.Repo.open(allocator, cwd, io()) catch |err| {
-        if (err == error.NotInitialized) fatal("no checkpoints found", .{});
+        if (err == error.NotInitialized) fatal("no dents yet; leave one with `dent`", .{});
         fatal("failed to open repo: {}", .{err});
     };
     defer r.deinit();
 
     const m = manifest_mod.read(allocator, r.manifests_dir, io(), id) catch |err| {
-        if (err == error.FileNotFound) fatal("checkpoint #{d} not found", .{id});
-        fatal("failed to read checkpoint #{d}: {}", .{ id, err });
+        if (err == error.FileNotFound) fatal("dent #{d} not found", .{id});
+        fatal("failed to read dent #{d}: {}", .{ id, err });
     };
     defer if (m.name.len > 0) allocator.free(m.name);
 
@@ -302,25 +352,25 @@ fn doNote(allocator: std.mem.Allocator, id: u32, note: []const u8) void {
     out("noted #{d} · {s}\n", .{ id, note });
 }
 
-fn doRemove(allocator: std.mem.Allocator, id: u32) void {
+fn doErase(allocator: std.mem.Allocator, id: u32) void {
     const cwd = openCwd();
     defer cwd.close(io());
     var r = repo_mod.Repo.open(allocator, cwd, io()) catch |err| {
-        if (err == error.NotInitialized) fatal("no checkpoints found", .{});
+        if (err == error.NotInitialized) fatal("no dents yet; leave one with `dent`", .{});
         fatal("failed to open repo: {}", .{err});
     };
     defer r.deinit();
 
     // Check manifest exists
     _ = manifest_mod.read(allocator, r.manifests_dir, io(), id) catch |err| {
-        if (err == error.FileNotFound) fatal("checkpoint #{d} not found", .{id});
-        fatal("failed to read checkpoint #{d}: {}", .{ id, err });
+        if (err == error.FileNotFound) fatal("dent #{d} not found", .{id});
+        fatal("failed to read dent #{d}: {}", .{ id, err });
     };
 
     // Delete the manifest file
     var name_buf: [32]u8 = undefined;
     const filename = std.fmt.bufPrint(&name_buf, "{d}.manifest", .{id}) catch unreachable;
-    r.manifests_dir.deleteFile(io(), filename) catch |e| fatal("failed to remove checkpoint #{d}: {}", .{ id, e });
+    r.manifests_dir.deleteFile(io(), filename) catch |e| fatal("failed to erase dent #{d}: {}", .{ id, e });
 
     // If this was latest, update to previous existing manifest
     const head = manifest_mod.readHead(r.cp_dir, io()) catch null;
@@ -339,30 +389,30 @@ fn doRemove(allocator: std.mem.Allocator, id: u32) void {
         }
     }
 
-    out("removed #{d} · working files unchanged\n", .{id});
+    out("erased #{d} · working files unchanged\n", .{id});
 }
 
 fn doDiff(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
     const cwd = openCwd();
     defer cwd.close(io());
     var r = repo_mod.Repo.open(allocator, cwd, io()) catch |err| {
-        if (err == error.NotInitialized) fatal("no checkpoints found", .{});
+        if (err == error.NotInitialized) fatal("no dents yet; leave one with `dent`", .{});
         fatal("failed to open repo: {}", .{err});
     };
     defer r.deinit();
 
-    // Resolve which snapshot we're comparing against
+    // Resolve which dent we're comparing against
     const resolved_id = if (id) |i| i else blk: {
         const head = manifest_mod.readHead(r.cp_dir, io()) catch fatal("failed to read latest", .{});
-        break :blk head orelse fatal("no checkpoints", .{});
+        break :blk head orelse fatal("no dents yet; leave one with `dent`", .{});
     };
 
     var result = r.diff(resolved_id) catch |e| fatal("diff failed: {}", .{e});
     defer result.deinit();
 
     if (path) |p| {
-        // Read snapshot version
-        const old_content = r.readSnapshotFile(resolved_id, p) catch |e| fatal("failed to read snapshot file: {}", .{e});
+        // Read the file as it was in this dent
+        const old_content = r.readSnapshotFile(resolved_id, p) catch |e| fatal("failed to read file from dent: {}", .{e});
         defer if (old_content) |c| allocator.free(c);
 
         // Read current working tree version
@@ -372,7 +422,7 @@ fn doDiff(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
         defer if (current) |c| allocator.free(c);
 
         if (old_content == null and current == null) {
-            out("{s}: not found in snapshot or current\n", .{p});
+            out("{s}: not found in dent or working files\n", .{p});
             return;
         }
 
@@ -390,7 +440,7 @@ fn doDiff(allocator: std.mem.Allocator, id: ?u32, path: ?[]const u8) void {
         return;
     }
 
-    // Header: which snapshot
+    // Header: which dent
     out("since #{d} · working changes\n", .{resolved_id});
 
     if (result.added.len == 0 and result.removed.len == 0 and result.modified.len == 0) {
@@ -407,7 +457,7 @@ fn doList(allocator: std.mem.Allocator, recent: ?u32) void {
     const cwd = openCwd();
     defer cwd.close(io());
     var r = repo_mod.Repo.open(allocator, cwd, io()) catch |err| {
-        if (err == error.NotInitialized) fatal("no checkpoints found", .{});
+        if (err == error.NotInitialized) fatal("no dents yet; leave one with `dent`", .{});
         fatal("failed to open repo: {}", .{err});
     };
     defer r.deinit();
@@ -425,13 +475,8 @@ fn doList(allocator: std.mem.Allocator, recent: ?u32) void {
         return;
     }
 
-    // Print full path of checkpoint storage
-    var path_buf: [4096]u8 = undefined;
-    const cwd_ptr = std.c.getcwd(&path_buf, path_buf.len);
-    if (cwd_ptr) |p| {
-        const cwd_path = std.mem.sliceTo(p, 0);
-        out("trail · {s}/.checkpoint-files/\n", .{cwd_path});
-    }
+    // Print full path of dent storage
+    out("trail · {s}/.dent-files/\n", .{repo_path});
 
     // Print newest first, limited by recent
     const show_count = if (recent) |n| @min(n, manifests.len) else manifests.len;
@@ -458,23 +503,23 @@ fn doCleanup(allocator: std.mem.Allocator, keep: u32) void {
     const cwd = openCwd();
     defer cwd.close(io());
     var r = repo_mod.Repo.open(allocator, cwd, io()) catch |err| {
-        if (err == error.NotInitialized) fatal("no checkpoints found", .{});
+        if (err == error.NotInitialized) fatal("no dents yet; leave one with `dent`", .{});
         fatal("failed to open repo: {}", .{err});
     };
     defer r.deinit();
     const deleted = r.pruneKeepLast(keep) catch |e| fatal("cleanup failed: {}", .{e});
     if (deleted == 0) {
-        out("trail unchanged · nothing to remove\n", .{});
+        out("trail unchanged · nothing to erase\n", .{});
     } else {
-        out("trimmed {d} dents · kept last {d}\n", .{ deleted, keep });
+        out("erased {d} dents · kept last {d}\n", .{ deleted, keep });
     }
 }
 
-fn doRemoveAll(allocator: std.mem.Allocator) void {
+fn doEraseAll(allocator: std.mem.Allocator) void {
     const cwd = openCwd();
     defer cwd.close(io());
     var r = repo_mod.Repo.open(allocator, cwd, io()) catch |err| {
-        if (err == error.NotInitialized) fatal("no checkpoints found", .{});
+        if (err == error.NotInitialized) fatal("no dents yet; leave one with `dent`", .{});
         fatal("failed to open repo: {}", .{err});
     };
     defer r.deinit();
@@ -486,11 +531,11 @@ fn doRemoveAll(allocator: std.mem.Allocator) void {
     }
 
     if (manifests.len == 0) {
-        out("trail empty · nothing to remove\n", .{});
+        out("trail empty · nothing to erase\n", .{});
         return;
     }
 
-    out("remove all {d} dents? This erases your recovery trail, not working files. [y/N] ", .{manifests.len});
+    out("erase all {d} dents? This erases your dent trail, not working files. [y/N] ", .{manifests.len});
 
     var buf: [16]u8 = undefined;
     const n = std.c.read(0, &buf, buf.len);
@@ -512,7 +557,7 @@ fn doRemoveAll(allocator: std.mem.Allocator) void {
     r.cp_dir.deleteFile(io(), "pack.dat") catch {};
     r.cp_dir.deleteFile(io(), "pack.idx") catch {};
 
-    out("removed all {d} dents · working files unchanged\n", .{manifests.len});
+    out("erased all {d} dents · working files unchanged\n", .{manifests.len});
 }
 
 fn formatSize(bytes: u64) [8]u8 {

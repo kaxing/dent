@@ -1,14 +1,28 @@
 # dent — leave a dent.
 
-Before an agent changes course, leave a dent so it can find its way back.
+Find your way in the file multiverse.
 
-`dent` saves fast, local checkpoints of your codebase. Give each one a note, explore a new direction, and roll back when it leads nowhere. No branches, no staging, no merge conflicts.
+Every edit takes your files somewhere new. Before you or your agent changes course, **leave a dent**. Try the refactor, follow an idea, take a wrong turn. Your trail gives you a way back.
+
+A dent holds your local files as they were, with a note about where you were headed. No staging, branches, or ceremony. Just `dent "before trying this"`.
+
+This is a multiverse of file changes—not parallel running environments. Travel changes your working files. Keep Git for commits and collaboration, and off-device backups for durable protection.
 
 ## Install
 
 ```sh
 brew install kaxing/toolbox/dent
 ```
+
+Stay current, then ask the installed CLI for its usage:
+
+```sh
+brew update && brew upgrade dent
+dent --version
+dent --help
+```
+
+Manual binaries: [latest release](https://github.com/kaxing/dent/releases/latest).
 
 ### From source
 
@@ -20,33 +34,33 @@ make install    # installs to /usr/local/bin/dent
 
 Requires Zig 0.16.0. Run `make test` to verify your build.
 
-## Leave a trail
+## Leave a dent. Explore. Find your way.
 
 ```sh
 dent "before refactoring auth"
-# Let your agent explore. Run your tests.
+# Follow the idea. Let your agent explore. Run your tests.
 dent diff
 dent list
-# Wrong turn? Find your way back.
-dent rollback 1
+# Wrong turn? Travel to a dent you recognize.
+dent travel 1
 ```
 
 For your agent instructions:
 
-> Before a risky edit, leave a dent with `dent "what you are about to change"`. Use `dent list` and `dent diff` to orient yourself. Ask before rolling back work that may belong to someone else.
+> Before a risky edit, leave a dent with `dent "what you are about to change"`. Use `dent list` to read your trail and `dent diff` to see where your files have gone. Ask before travel or erasing dents. Run `dent --help` for current usage.
 
-A dent is a local file checkpoint, not a backup or a record of the agent's conversation. Keep using Git and off-device backups for durable history.
+A dent holds files, not an agent's conversation or reasoning. See [skill.md](skill.md) for the minimal agent skill.
 
-## Read the trail
+## Read your trail
 
-Output is plain text: no animation, no color dependency. Every saved state has a numeric ID you can pass straight to a command.
+Every dent has a numeric ID. Output is plain text: no animation, no color dependency, and IDs you can pass straight to a command.
 
 ```text
 $ dent "before refactoring auth"
 dent #1 · before refactoring auth
 
 $ dent list
-trail · /your/project/.checkpoint-files/
+trail · /your/project/.dent-files/
 1 of 1 dents · newest first
 
 #1 · before refactoring auth
@@ -56,42 +70,61 @@ $ dent diff
 since #1 · working changes
   ~ src/auth.ts
 
-$ dent rollback 1
-dent #2 · <auto> · saved before rollback
+$ dent travel 1
+dent #2 · <auto> · left before travel
 back to #1 · restored
 ```
 
-The trail shows newest dents first. Rollback always reports the ID it restored, including when you omit the ID. Errors go to stderr with a `dent:` prefix and a nonzero exit code.
+Your trail runs newest first. Travel always reports the dent it returned to, including when you omit the ID. Errors go to stderr with a `dent:` prefix and a nonzero exit code.
 
-## Commands
+## Choose your direction
 
 ```text
-dent                       leave a dent (save a checkpoint)
-dent "message"             leave a dent with a note
-dent rollback              return to the latest checkpoint
-dent rollback <id>         return to a specific checkpoint
-dent rollback <id> <path>  restore a single file
-dent diff                  compare current files with the latest checkpoint
-dent diff <id>             compare current files with a checkpoint
-dent diff <id> <path>      show content diff for one file
-dent list                  show your trail of checkpoints
-dent list <N>              show the last N checkpoints
-dent edit <id> "message"   update a checkpoint's note
-dent remove <id>           remove a checkpoint
-dent remove --keep <N>     keep only the last N checkpoints
-dent remove all            remove all checkpoints (asks for confirmation)
-dent version               show version
+dent                      leave a dent
+dent "message"            leave a dent with a note
+dent travel               return to the latest dent
+dent travel <id>          return to a specific dent
+dent travel <id> <path>   restore a single file
+dent diff                 compare current files with the latest dent
+dent diff <id>            compare current files with a dent
+dent diff <id> <path>     show content diff for one file
+dent list                 read your trail of dents
+dent list <N>             show the last N dents
+dent edit <id> "message"  update a dent's note
+dent erase <id>           erase a dent
+dent erase --keep <N>     erase all but the last N dents
+dent erase all            erase all dents (asks for confirmation)
+dent version              show version
+dent --help               show current usage
 ```
 
-Full rollback saves changed current state as `<auto>` before restoring, unless that state is already on the trail. Only one `<auto>` is retained. Single-file rollback does **not** auto-save. Rollback can overwrite or remove working files; inspect your trail before using it.
+**Travel can overwrite or remove working files.** Full travel first leaves an `<auto>` dent of changed current files, unless they are already on the trail. Only one `<auto>` is retained. Single-file travel does **not** leave an automatic dent. Read your trail before returning to one.
 
-## Previously checkpoint / check
+**Erase changes your trail, not your working files.** `dent erase <id>` erases one dent; `dent erase --keep <N>` trims older dents; `dent erase all` asks before erasing the whole trail. Erased dents are no longer available as travel destinations.
 
-The project is now `kaxing/dent` and the command is `dent`. Existing `.checkpoint-files/` directories remain readable in place; the storage format and directory name are unchanged. No data migration is needed. Update scripts from `check` to `dent`.
+## One trail from wherever you stand
 
-## How it works
+Dent checks the current directory, then its ancestors, and uses the nearest `.dent-files/`. From a subdirectory, you still work with that whole repository's trail—not just the files beneath your feet. File arguments remain relative to the directory where you run dent.
 
-FastCDC content-defined chunking, BLAKE3 hashing, and zstd compression. Unchanged files are skipped via mtime and size; changed files are processed in parallel, with sequential pack writes.
+When the trail belongs to a parent, dent tells you on stderr:
+
+```text
+tracking dents from parent · /your/project/.dent-files/
+```
+
+If no trail exists above you, leaving your first dent creates `.dent-files/` in the current directory. Other commands report that there are no dents yet. Keep `.dent-files/` to retain your way back, and exclude it from Git.
+
+### Nested trails travel with their files
+
+Only the active root `.dent-files/` is excluded from its own dents. Nested folders—including any existing nested `.dent-files/` histories—travel with the files in a parent dent. **Travel from the parent can restore or remove those nested histories too.**
+
+Upward discovery avoids accidentally starting another trail inside an existing one. If a nested trail already exists, such as in a copied project, commands inside it use that nearest trail. Trails are not merged or migrated. A broken nearest `.dent-files/` produces an error rather than silently choosing a different trail.
+
+Git metadata and ordinary-file ignore rules still apply. Nested history contents are not filtered by `.gitignore` patterns. Dents contain regular files, not empty directories or symlinks.
+
+## Under the trail
+
+Dent splits file contents with FastCDC, identifies chunks with BLAKE3, and compresses them with zstd. Shared chunks avoid storing the same content repeatedly. Unchanged files are skipped via mtime and size; changed files are processed in parallel, with sequential pack writes.
 
 Run `make bench` to measure performance on your machine.
 

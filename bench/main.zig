@@ -309,7 +309,7 @@ pub fn main() !void {
     defer _ = gpa_impl.deinit();
     const allocator = gpa_impl.allocator();
 
-    print("\n=== Checkpoint Algorithm Benchmark ===\n", .{});
+    print("\n=== Denting Algorithm Benchmark ===\n", .{});
     print("Data size: {d} MB, Iterations: {d}\n\n", .{ DATA_SIZE / (1024 * 1024), BENCH_ITERS });
 
     print("Generating synthetic data...\n", .{});
@@ -325,7 +325,7 @@ pub fn main() !void {
 
     // Header
     print("{s: <12} {s: <6}  {s: >10} {s: >10} {s: >10} {s: >7}\n", .{
-        "Chunker", "Hash", "Save MB/s", "Rest MB/s", "Avg Chunk", "Dedup",
+        "Chunker", "Hash", "Dent MB/s", "Back MB/s", "Avg Chunk", "Dedup",
     });
     print("{s}\n", .{"-" ** 62});
 
@@ -360,7 +360,7 @@ pub fn main() !void {
     }
 
     print("\nNotes:\n", .{});
-    print("  - Dedup: unique/total chunks across 2 snapshots w/ 1% edits (lower=better)\n", .{});
+    print("  - Dedup: unique/total chunks across 2 dents w/ 1% edits (lower=better)\n", .{});
     print("  - Compression not benchmarked: Zig 0.15 stdlib deflate compressor is incomplete,\n", .{});
     print("    zstd has decompressor only. Will use C libzstd binding for production.\n\n", .{});
 }

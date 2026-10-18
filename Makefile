@@ -12,6 +12,7 @@ uninstall:
 test: build
 	zig build test
 	bash test-coverage/integration.sh
+	bash test-coverage/discovery.sh
 
 test-multiarch:
 	docker buildx build --platform linux/arm64 -f test-coverage/Dockerfile --target integration .

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Benchmark: dent vs git stash
-# Tests save/restore latency on realistic source trees
+# Measures leaving a dent and finding your way back on realistic source trees
 
 set -e
 
@@ -82,17 +82,17 @@ bench_scenario() {
     cp -r "$dir" "$check_dir"
     cd "$check_dir"
 
-    # First save (cold)
+    # First dent (cold)
     local check_save1=$(time_ms "$CHECK 'initial' >/dev/null")
 
     # Apply edits
     apply_edits "$check_dir"
 
-    # Second save (warm, with dedup)
+    # Next dent (warm, with dedup)
     local check_save2=$(time_ms "$CHECK 'after-edit' >/dev/null")
 
-    # Restore
-    local check_restore=$(time_ms "$CHECK rollback 1 >/dev/null")
+    # Return to the first dent
+    local check_restore=$(time_ms "$CHECK travel 1 >/dev/null")
 
     # --- git stash ---
     local git_dir="$TMPDIR/git_$name"
@@ -117,9 +117,9 @@ bench_scenario() {
 
     # Print results
     printf "%-20s %8s %8s\n"    ""           "dent"    "git"
-    printf "%-20s %7dms %8s\n"  "save (cold)"    "$check_save1" "-"
-    printf "%-20s %7dms %7dms\n" "save (warm)"    "$check_save2" "$git_save"
-    printf "%-20s %7dms %7dms\n" "restore"         "$check_restore" "$git_restore"
+    printf "%-20s %7dms %8s\n"  "leave dent (cold)"    "$check_save1" "-"
+    printf "%-20s %7dms %7dms\n" "leave dent / stash"    "$check_save2" "$git_save"
+    printf "%-20s %7dms %7dms\n" "return"          "$check_restore" "$git_restore"
 
     cd "$TMPDIR"
 }
@@ -136,7 +136,8 @@ bench_scenario "large"  "$LARGE"  2000
 
 echo ""
 echo "Notes:"
-echo "  - dent save (cold): first snapshot, no dedup possible"
-echo "  - dent save (warm): second snapshot, ~95% chunks deduped"
+echo "  - leave dent (cold): first dent, no earlier dent to share chunks with"
+echo "  - leave dent / stash: next dent after editing ~5% of files, versus git stash"
+echo "  - return: dent travel 1 versus git stash pop"
 echo "  - git stash: requires existing repo with initial commit"
 echo "  - times in milliseconds, lower is better"

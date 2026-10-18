@@ -10,7 +10,7 @@ const comp = @import("compress.zig");
 const Hash = hash_mod.Hash;
 const Io = std.Io;
 const Dir = Io.Dir;
-const CHECKPOINT_DIR = ".checkpoint-files";
+const DENT_DIR = ".dent-files";
 const MAX_SNAPSHOTS = 50;
 
 const FileResult = struct {
@@ -32,24 +32,21 @@ pub const Repo = struct {
     manifests_dir: Dir,
     pack: pack_mod.Pack,
 
-    pub fn open(allocator: std.mem.Allocator, root: Dir, io: Io) error{NotInitialized}!Repo {
-        const cp_dir = root.openDir(io, CHECKPOINT_DIR, .{}) catch
-            return error.NotInitialized;
-        return finishOpen(allocator, root, cp_dir, io) catch
-            return error.NotInitialized;
+    pub fn open(allocator: std.mem.Allocator, root: Dir, io: Io) !Repo {
+        if (!try walker_mod.hasDent(root, io)) return error.NotInitialized;
+        const cp_dir = try root.openDir(io, DENT_DIR, .{});
+        errdefer cp_dir.close(io);
+        return finishOpen(allocator, root, cp_dir, io);
     }
 
     pub fn openOrCreate(allocator: std.mem.Allocator, root: Dir, io_arg: Io) !Repo {
-        if (root.openDir(io_arg, CHECKPOINT_DIR, .{})) |cp_dir| {
-            if (finishOpen(allocator, root, cp_dir, io_arg)) |repo| {
-                return repo;
-            } else |_| {}
-        } else |_| {}
+        if (try walker_mod.hasDent(root, io_arg)) return open(allocator, root, io_arg);
         return create(allocator, root, io_arg);
     }
 
     fn finishOpen(allocator: std.mem.Allocator, root: Dir, cp_dir: Dir, io: Io) !Repo {
         const manifests_dir = try cp_dir.openDir(io, "manifests", .{});
+        errdefer manifests_dir.close(io);
         const pack = try pack_mod.Pack.init(allocator, cp_dir, io);
 
         return .{
@@ -63,10 +60,10 @@ pub const Repo = struct {
     }
 
     pub fn create(allocator: std.mem.Allocator, root: Dir, io: Io) !Repo {
-        root.createDir(io, CHECKPOINT_DIR, .default_dir) catch |err| {
+        root.createDir(io, DENT_DIR, .default_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
-        var cp_dir = try root.openDir(io, CHECKPOINT_DIR, .{});
+        var cp_dir = try root.openDir(io, DENT_DIR, .{});
         errdefer cp_dir.close(io);
 
         cp_dir.createDir(io, "manifests", .default_dir) catch |err| {
@@ -242,7 +239,7 @@ pub const Repo = struct {
         const entries = try tree_mod.deserialize(self.allocator, tree_data);
         defer tree_mod.freeEntries(self.allocator, entries);
 
-        // Delete files not in snapshot
+        // Delete files not in the target dent
         var walker = try walker_mod.Walker.init(self.allocator, self.root, self.io);
         defer walker.deinit();
         const current_files = try walker.walk(self.root, self.io);
@@ -259,12 +256,17 @@ pub const Repo = struct {
 
         // Read all file contents from pack (sequential reads)
         const file_contents = try self.allocator.alloc(?[]u8, entries.len);
+        @memset(file_contents, null);
         defer {
             for (file_contents) |fc| if (fc) |c| self.allocator.free(c);
             self.allocator.free(file_contents);
         }
 
         for (entries, 0..) |entry, i| {
+            if (walker_mod.isProtected(entry.path)) {
+                file_contents[i] = null;
+                continue;
+            }
             if (entry.chunk_hashes.len == 0) {
                 file_contents[i] = try self.allocator.alloc(u8, 0);
                 continue;
@@ -291,7 +293,8 @@ pub const Repo = struct {
         }
 
         // Write files
-        for (entries) |entry| {
+        for (entries, 0..) |entry, i| {
+            if (file_contents[i] == null) continue;
             if (std.fs.path.dirname(entry.path)) |dp| self.root.createDirPath(self.io, dp) catch {};
         }
 
@@ -307,6 +310,7 @@ pub const Repo = struct {
     }
 
     pub fn restoreFile(self: *Repo, target_id: u32, path: []const u8) !void {
+        if (walker_mod.isProtected(path)) return error.ProtectedPath;
         const m = try manifest_mod.read(self.allocator, self.manifests_dir, self.io, target_id);
         defer if (m.name.len > 0) self.allocator.free(m.name);
 
@@ -389,6 +393,10 @@ pub const Repo = struct {
         var oi: usize = 0;
         var ni: usize = 0;
         while (oi < old_entries.len or ni < new_entries.len) {
+            if (oi < old_entries.len and walker_mod.isProtected(old_entries[oi].path)) {
+                oi += 1;
+                continue;
+            }
             if (oi >= old_entries.len) {
                 try added.append(self.allocator, try self.allocator.dupe(u8, new_entries[ni].path));
                 ni += 1;
@@ -496,7 +504,7 @@ pub const Repo = struct {
         }
     }
 
-    /// Read a file's content from a snapshot by reassembling its chunks
+    /// Read a file as it was in a dent by reassembling its chunks
     pub fn readSnapshotFile(self: *Repo, snapshot_id: u32, path: []const u8) !?[]u8 {
         const m = try manifest_mod.read(self.allocator, self.manifests_dir, self.io, snapshot_id);
         defer if (m.name.len > 0) self.allocator.free(m.name);
@@ -530,7 +538,7 @@ pub const Repo = struct {
     }
 
     fn cleanEmptyDirs(self: *Repo) !void {
-        var iter = try self.root.walk(self.allocator);
+        var iter = try self.root.walkSelectively(self.allocator);
         defer iter.deinit();
 
         var dirs: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
@@ -541,9 +549,9 @@ pub const Repo = struct {
 
         while (try iter.next(self.io)) |entry| {
             if (entry.kind == .directory) {
-                if (std.mem.startsWith(u8, entry.path, CHECKPOINT_DIR)) continue;
-                if (std.mem.eql(u8, entry.path, ".git") or std.mem.startsWith(u8, entry.path, ".git/")) continue;
+                if (walker_mod.isProtected(entry.path)) continue;
                 try dirs.append(self.allocator, try self.allocator.dupe(u8, entry.path));
+                try iter.enter(self.io, entry);
             }
         }
 

@@ -30,30 +30,35 @@ fails() {
 }
 
 new_dir
-contains "$("$DENT" --help)" 'leave a dent. Find your way back.'
+contains "$("$DENT" --help)" 'dent — leave a dent.'
+contains "$("$DENT" --help)" 'Find your way in the file multiverse.'
+contains "$("$DENT" --help)" 'Travel can overwrite files'
+contains "$("$DENT" --help)" 'nearest .dent-files/'
 contains "$("$DENT" --help)" 'READ THE TRAIL'
 contains "$("$DENT" --help)" 'without auto-save'
 equals "$("$DENT" version)" 'v0.0.5'
 equals "$("$DENT" --version)" 'v0.0.5'
 # Informational commands must not create storage.
-[ ! -d .checkpoint-files ]
-for command in rollback diff list; do fails "$DENT" "$command"; done
-fails "$DENT" remove 1
+[ ! -d .dent-files ]
+for command in travel diff list; do fails "$DENT" "$command"; done
+fails "$DENT" erase 1
 
-# Save, notes, duplicate detection and the legacy storage location.
+# Denting, notes, duplicate detection and storage.
 echo one > file.txt
 contains "$("$DENT" 'before the refactor')" 'dent #1 · before the refactor'
-[ -d .checkpoint-files ]
+[ -d .dent-files ]
 contains "$("$DENT")" 'unchanged · already on your trail'
 contains "$("$DENT" list)" '1 of 1 dents'
-contains "$("$DENT" list)" '.checkpoint-files/'
+contains "$("$DENT" list)" '.dent-files/'
 contains "$("$DENT" edit 1 'known good')" 'noted #1 · known good'
 contains "$("$DENT" list)" '#1 · known good'
 fails "$DENT" edit 99 nope
-fails "$DENT" remove 99
-contains "$("$DENT" remove)" 'dent remove'
+fails "$DENT" erase 99
+contains "$("$DENT" erase)" 'dent erase'
+contains "$("$DENT" --help)" 'ERASE DENTS'
+contains "$("$DENT" --help)" 'Erase deletes dents from your trail, not your working files.'
 
-# Diff and rollback, including recovery of unsaved work.
+# Diff and travel, including recovery of unsaved work.
 echo two > file.txt
 echo added > added.txt
 OUT=$("$DENT" diff)
@@ -66,27 +71,27 @@ contains "$OUT" '+++ current file.txt'
 contains "$OUT" '-one'
 contains "$OUT" '+two'
 contains "$("$DENT" diff 1 added.txt)" '+added'
-OUT=$("$DENT" rollback 1)
-contains "$OUT" 'dent #2 · <auto> · saved before rollback'
+OUT=$("$DENT" travel 1)
+contains "$OUT" 'dent #2 · <auto> · left before travel'
 contains "$OUT" 'back to #1 · restored'
 equals "$(<file.txt)" one
 [ ! -f added.txt ]
 contains "$("$DENT" list)" '#2 · <auto>'
-"$DENT" rollback 2 >/dev/null
+"$DENT" travel 2 >/dev/null
 equals "$(<file.txt)" two
 equals "$(<added.txt)" added
 contains "$("$DENT" diff 2 file.txt)" 'no changes'
 rm added.txt
 contains "$("$DENT" diff 2)" '- added.txt'
 
-# A single-file rollback changes only that file, without auto-saving.
+# Single-file travel changes only that file, without auto-saving.
 new_dir
 echo original > a.txt
 echo original > b.txt
 "$DENT" >/dev/null
 echo changed > a.txt
 echo changed > b.txt
-contains "$("$DENT" rollback 1 a.txt)" 'back to #1 · a.txt'
+contains "$("$DENT" travel 1 a.txt)" 'back to #1 · a.txt'
 equals "$(<a.txt)" original
 equals "$(<b.txt)" changed
 contains "$("$DENT" list)" '1 of 1 dents'
@@ -97,43 +102,44 @@ echo one > f
 "$DENT" one >/dev/null
 echo two > f
 "$DENT" two >/dev/null
-"$DENT" rollback 1 >/dev/null
+"$DENT" travel 1 >/dev/null
 equals "$("$DENT" list | grep -c '<auto>' || true)" 0
 echo dirty > f
-"$DENT" rollback 2 >/dev/null
+"$DENT" travel 2 >/dev/null
 echo dirtier > f
-"$DENT" rollback 1 >/dev/null
+"$DENT" travel 1 >/dev/null
 equals "$("$DENT" list | grep -c '<auto>')" 1
 
-# Latest rollback names its actual target; list limits and pruning.
+# Travel without an ID names its actual target; list limits and pruning.
 new_dir
 for i in 1 2 3 4 5; do
     echo "v$i" > f
     "$DENT" "step $i" >/dev/null
 done
 echo unsaved > f
-contains "$("$DENT" rollback)" 'back to #5 · restored'
+contains "$("$DENT" travel)" 'back to #5 · restored'
 equals "$(<f)" v5
-contains "$("$DENT" remove 6)" 'removed #6 · working files unchanged'
+contains "$("$DENT" erase 6)" 'erased #6 · working files unchanged'
 OUT=$("$DENT" list 2)
 contains "$OUT" '2 of 5 dents'
 contains "$OUT" '#5 · step 5'
 contains "$OUT" '#4 · step 4'
 if grep -qF 'step 3' <<< "$OUT"; then exit 1; fi
-contains "$("$DENT" remove --keep 2)" 'trimmed 3 dents · kept last 2'
+contains "$("$DENT" erase --keep 2)" 'erased 3 dents · kept last 2'
 contains "$("$DENT" list)" '2 of 2 dents'
-fails "$DENT" remove --keep 0
-contains "$("$DENT" remove --keep 10)" 'trail unchanged · nothing to remove'
-contains "$(printf 'n\n' | "$DENT" remove all)" 'cancelled · trail unchanged'
+fails "$DENT" erase --keep 0
+contains "$("$DENT" erase --keep 10)" 'trail unchanged · nothing to erase'
+contains "$(printf 'n\n' | "$DENT" erase all)" 'cancelled · trail unchanged'
 contains "$("$DENT" list)" '2 of 2 dents'
-OUT=$(printf 'y\n' | "$DENT" remove all)
-contains "$OUT" 'This erases your recovery trail, not working files.'
-contains "$OUT" 'removed all 2 dents · working files unchanged'
+OUT=$(printf 'y\n' | "$DENT" erase all)
+contains "$OUT" 'erase all 2 dents?'
+contains "$OUT" 'This erases your dent trail, not working files.'
+contains "$OUT" 'erased all 2 dents · working files unchanged'
 equals "$(<f)" v5
 contains "$("$DENT" list)" 'no dents yet · leave one with `dent`'
-contains "$("$DENT" remove all)" 'trail empty · nothing to remove'
+contains "$("$DENT" erase all)" 'trail empty · nothing to erase'
 
-# Empty, binary and deeply nested files survive rollback.
+# Empty, binary and deeply nested files survive travel.
 new_dir
 touch empty
 mkdir -p a/b/c
@@ -144,13 +150,24 @@ cp binary "$ROOT/original-binary"
 echo filled > empty
 rm -r a
 echo changed > binary
-"$DENT" rollback 1 >/dev/null
+"$DENT" travel 1 >/dev/null
 [ ! -s empty ]
 equals "$(<a/b/c/file)" nested
 cmp binary "$ROOT/original-binary"
 
-# Multiple saved states remain reachable after successive rollbacks.
+# Earlier dents remain reachable after successive travels.
 new_dir
 for i in 1 2 3; do echo "$i" > f; "$DENT" >/dev/null; done
-for i in 1 2 3; do "$DENT" rollback "$i" >/dev/null; equals "$(<f)" "$i"; done
+for i in 1 2 3; do "$DENT" travel "$i" >/dev/null; equals "$(<f)" "$i"; done
+# User-facing language stays about dents and working files.
+new_dir
+echo here > f
+contains "$("$DENT")" 'dent #1 · left here'
+contains "$("$DENT" diff 1 missing)" 'missing: not found in dent or working files'
+# Invalid destinations must fail before changing files or leaving an auto dent.
+echo changed > f
+fails "$DENT" travel oops
+fails "$DENT" travel 999999999999999999999
+equals "$(<f)" changed
+contains "$("$DENT" list)" '1 of 1 dents'
 printf 'All %d output assertions and file recovery checks passed.\n' "$PASS"

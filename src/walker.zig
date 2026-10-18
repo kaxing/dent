@@ -3,6 +3,24 @@ const std = @import("std");
 const Io = std.Io;
 const Dir = Io.Dir;
 
+// Stop discovery at a marker even when its history is incomplete or damaged.
+pub fn hasDent(dir: Dir, io: Io) !bool {
+    _ = dir.statFile(io, ".dent-files", .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+pub fn isProtected(path: []const u8) bool {
+    if (std.mem.eql(u8, path, ".dent-files") or std.mem.startsWith(u8, path, ".dent-files/")) return true;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |part| {
+        if (std.mem.eql(u8, part, ".git")) return true;
+    }
+    return false;
+}
+
 pub const WalkEntry = struct {
     path: []const u8, // relative to root, owned
     size: u64,
@@ -23,7 +41,6 @@ pub const Walker = struct {
         };
 
         // Always ignore these (static strings, not allocated)
-        try w.ignore_patterns.append(allocator, ".checkpoint-files");
         try w.ignore_patterns.append(allocator, ".git");
         w.patterns_start = w.ignore_patterns.items.len;
 
@@ -64,12 +81,16 @@ pub const Walker = struct {
             entries.deinit(self.allocator);
         }
 
-        var iter = try root.walk(self.allocator);
+        var iter = try root.walkSelectively(self.allocator);
         defer iter.deinit();
 
         while (try iter.next(io)) |entry| {
-            if (entry.kind != .file) continue;
             if (self.isIgnored(entry.path)) continue;
+            if (entry.kind == .directory) {
+                try iter.enter(io, entry);
+                continue;
+            }
+            if (entry.kind != .file) continue;
 
             const path = try self.allocator.dupe(u8, entry.path);
             const stat = root.statFile(io, entry.path, .{}) catch {
@@ -95,6 +116,13 @@ pub const Walker = struct {
     }
 
     fn isIgnored(self: *Walker, path: []const u8) bool {
+        if (isProtected(path)) return true;
+        // Nested histories travel with the files in a dent. Do not partially
+        // capture them because .gitignore contains .dent-files or *.idx, etc.
+        var components = std.mem.splitScalar(u8, path, '/');
+        while (components.next()) |part| {
+            if (std.mem.eql(u8, part, ".dent-files")) return false;
+        }
         for (self.ignore_patterns.items) |pattern| {
             if (matchPattern(pattern, path)) return true;
         }
